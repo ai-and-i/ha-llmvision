@@ -1,5 +1,6 @@
 """Comprehensive unit tests for providers.py module."""
 
+import asyncio
 import json
 import pytest
 import base64
@@ -3135,6 +3136,56 @@ def test_google_oversized_video_without_upload_sends_images(large_video_google):
     )
 
     assert _inline_parts(payload) == [{"mime_type": "image/jpeg", "data": "aW1n"}]
+
+
+
+@pytest.mark.parametrize(
+    ("model", "expected"),
+    [
+        ("gemini-2.5-flash", True),
+        ("gemini-2.5-pro", True),
+        ("gemini-3-pro-preview", True),
+        ("gemini-3.1-flash-lite", True),
+        ("gemini-4-argon", True),
+        ("models/Gemini-4-Argon", True),
+        ("gemini-2.0-flash", False),
+        ("gemini-1.5-pro", False),
+        ("gemini-pro", False),
+        ("gemma-3-27b-it", False),
+    ],
+)
+def test_google_model_supports_thinking(coverage_hass, model, expected):
+    assert Google(coverage_hass, "k", model)._model_supports_thinking() is expected
+
+
+def test_google_sends_thinking_budget_for_gemini_4(coverage_hass):
+    coverage_hass.data[DOMAIN]["provider_openai"][CONF_THINKING_BUDGET] = 1024
+
+    payload = Google(coverage_hass, "k", "gemini-4-argon")._prepare_vision_data(
+        make_coverage_call()
+    )
+
+    assert payload["generationConfig"]["thinkingConfig"] == {"thinkingBudget": 1024}
+
+
+@pytest.mark.anyio
+async def test_post_reports_timeout_with_its_duration(coverage_hass):
+    provider = Google(coverage_hass, "k", "gemini-4-argon")
+    provider.session = Mock()
+    provider.session.post = AsyncMock(side_effect=asyncio.TimeoutError())
+
+    with pytest.raises(ServiceValidationError, match="Request timed out after 30 seconds"):
+        await provider._post("https://example.com", {}, {})
+
+
+@pytest.mark.anyio
+async def test_post_reports_exception_type(coverage_hass):
+    provider = Google(coverage_hass, "k", "gemini-4-argon")
+    provider.session = Mock()
+    provider.session.post = AsyncMock(side_effect=ConnectionResetError())
+
+    with pytest.raises(ServiceValidationError, match="Request failed: ConnectionResetError"):
+        await provider._post("https://example.com", {}, {})
 
 
 if __name__ == "__main__":

@@ -570,8 +570,14 @@ class Provider(ABC):
                 json=data,
                 timeout=ClientTimeout(total=self.request_timeout),
             )
+        except asyncio.TimeoutError:
+            # str() of a timeout is empty, which left "Request failed:" with no reason
+            raise ServiceValidationError(
+                f"Request timed out after {self.request_timeout} seconds "
+                "(request_timeout in LLM Vision Settings)"
+            )
         except Exception as e:
-            raise ServiceValidationError(f"Request failed: {e}")
+            raise ServiceValidationError(f"Request failed: {type(e).__name__}: {e}")
 
         if response.status != 200:
             frame = inspect.stack()[1]
@@ -1321,7 +1327,9 @@ class Google(Provider):
         return True
 
     def _model_supports_thinking(self) -> bool:
-        return any(m in self.model for m in ["gemini-2.5", "gemini-3"])
+        # Gemini 2.5 and later, e.g. gemini-2.5-flash, gemini-3.1-pro, gemini-4-argon
+        match = re.search(r"gemini-(\d+(?:\.\d+)?)", self.model.lower())
+        return bool(match) and float(match.group(1)) >= 2.5
 
     @classmethod
     def supports_video_input(cls, model: str) -> bool:
