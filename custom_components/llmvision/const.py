@@ -75,6 +75,14 @@ FPS = "fps"
 FPS_MODE = "fps_mode"
 FPS_MODE_VARIABLE = "variable"  # max_frames frames with the most change
 FPS_MODE_CONSTANT = "constant"  # one frame every 1/fps seconds, up to max_frames
+SAVE_CLIP = "save_clip"
+CLIP_PATH = "clip_path"
+
+# Where video_analyzer keeps source clips for timeline events
+CLIPS_DIR = f"/media/{DOMAIN}/clips"
+# Saved clips keep the source container. Anything else, or no
+# extension (such as a Frigate API URL), is saved as .mp4.
+CLIP_EXTENSIONS = (".mp4", ".m4v", ".mov", ".webm", ".mkv")
 RESPONSE_FORMAT = "response_format"
 STRUCTURE = "structure"
 TITLE_FIELD = "title_field"

@@ -1145,3 +1145,210 @@ class TestMediaProcessor:
 
         assert result is processor.client
         processor.add_images.assert_awaited_once()
+
+    # ------------------------------------------------------------------
+    # save_clip: keep the source video
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _download_to(processor, tmp_path, payload=b"remote video bytes"):
+        """Make the remote download land in tmp_path/download.mp4."""
+        download = tmp_path / "download.mp4"
+
+        class FakeTempFile:
+            name = str(download)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        async def fake_fetch(_url, target_file=None, **kwargs):
+            with open(target_file, "wb") as f:
+                f.write(payload)
+
+        processor._fetch = fake_fetch
+        return download, patch(
+            "custom_components.llmvision.media_handlers.tempfile.NamedTemporaryFile",
+            return_value=FakeTempFile(),
+        )
+
+    def _ffmpeg_patch(self, payload=None):
+        return patch(
+            "custom_components.llmvision.media_handlers.asyncio.create_subprocess_exec",
+            AsyncMock(
+                return_value=self._fake_ffmpeg(
+                    _make_jpeg_bytes("black") if payload is None else payload
+                )
+            ),
+        )
+
+    @pytest.mark.asyncio
+    async def test_save_clip_moves_remote_download_into_clips(
+        self, processor, tmp_path
+    ):
+        self._run_executor_inline(processor)
+        processor.resize_image = AsyncMock(return_value="encoded")
+        processor.clips_path = str(tmp_path / "clips")
+        download, temp_patch = self._download_to(processor, tmp_path)
+
+        with temp_patch, self._ffmpeg_patch():
+            await processor.add_video(
+                video_path="https://example.com/ring/clip.mp4?token=abc",
+                base_url="http://ha.local",
+                save_clip=True,
+            )
+
+        assert not download.exists()
+        assert os.path.dirname(processor.clip) == processor.clips_path
+        assert processor.clip.endswith(".mp4")
+        # Kept as downloaded, not re-encoded
+        with open(processor.clip, "rb") as f:
+            assert f.read() == b"remote video bytes"
+
+    @pytest.mark.asyncio
+    async def test_save_clip_copies_local_file_and_keeps_extension(
+        self, processor, tmp_path
+    ):
+        self._run_executor_inline(processor)
+        processor.resize_image = AsyncMock(return_value="encoded")
+        processor.clips_path = str(tmp_path / "clips")
+        source = tmp_path / "recording.MOV"
+        source.write_bytes(b"local video bytes")
+        old_ts = 1_000_000_000
+        os.utime(source, (old_ts, old_ts))
+
+        with self._ffmpeg_patch():
+            await processor.add_video(
+                video_path=str(source), base_url="http://ha.local", save_clip=True
+            )
+
+        # The user's file is left where it was
+        assert source.read_bytes() == b"local video bytes"
+        assert processor.clip.endswith(".mov")
+        with open(processor.clip, "rb") as f:
+            assert f.read() == b"local video bytes"
+        # Cleanup's grace period counts from when the clip was saved
+        assert os.path.getmtime(processor.clip) > old_ts + 1_000_000
+
+    @pytest.mark.asyncio
+    async def test_save_clip_names_unknown_extension_mp4(self, processor, tmp_path):
+        self._run_executor_inline(processor)
+        processor.resize_image = AsyncMock(return_value="encoded")
+        processor.clips_path = str(tmp_path / "clips")
+        source = tmp_path / "stream.php"
+        source.write_bytes(b"video")
+
+        with self._ffmpeg_patch():
+            await processor.add_video(
+                video_path=str(source), base_url="http://ha.local", save_clip=True
+            )
+
+        assert processor.clip.endswith(".mp4")
+
+    @pytest.mark.asyncio
+    async def test_no_clip_without_save_clip(self, processor, tmp_path):
+        self._run_executor_inline(processor)
+        processor.resize_image = AsyncMock(return_value="encoded")
+        processor.clips_path = str(tmp_path / "clips")
+        download, temp_patch = self._download_to(processor, tmp_path)
+
+        with temp_patch, self._ffmpeg_patch():
+            await processor.add_video(
+                video_path="https://example.com/clip.mp4", base_url="http://ha.local"
+            )
+
+        assert processor.clip == ""
+        assert not download.exists()
+        assert not os.path.exists(processor.clips_path)
+
+    @pytest.mark.asyncio
+    async def test_no_clip_when_video_processing_fails(self, processor, tmp_path):
+        self._run_executor_inline(processor)
+        processor.clips_path = str(tmp_path / "clips")
+        download, temp_patch = self._download_to(processor, tmp_path)
+
+        with temp_patch, self._ffmpeg_patch(payload=b""), pytest.raises(
+            ServiceValidationError, match="No frames"
+        ):
+            await processor.add_video(
+                video_path="https://example.com/clip.mp4",
+                base_url="http://ha.local",
+                save_clip=True,
+            )
+
+        assert processor.clip == ""
+        assert not download.exists()
+        assert not os.path.exists(processor.clips_path)
+
+    @pytest.mark.asyncio
+    async def test_failed_save_leaves_analysis_and_removes_download(
+        self, processor, tmp_path
+    ):
+        self._run_executor_inline(processor)
+        processor.resize_image = AsyncMock(return_value="encoded")
+        processor.clips_path = str(tmp_path / "clips")
+        download, temp_patch = self._download_to(processor, tmp_path)
+
+        with temp_patch, self._ffmpeg_patch(), patch(
+            "custom_components.llmvision.media_handlers.shutil.move",
+            side_effect=OSError("No space left on device"),
+        ):
+            await processor.add_video(
+                video_path="https://example.com/clip.mp4",
+                base_url="http://ha.local",
+                save_clip=True,
+            )
+
+        assert processor.clip == ""
+        processor.client.add_frame.assert_called_once()
+        assert not download.exists()
+        assert os.listdir(processor.clips_path) == []
+
+    @pytest.mark.asyncio
+    async def test_add_videos_saves_only_the_first_clip(self, processor):
+        processor.add_video = AsyncMock()
+
+        with patch(
+            "custom_components.llmvision.media_handlers.get_url",
+            return_value="http://ha.local",
+        ):
+            await processor.add_videos(
+                video_paths=["/tmp/first.mp4", "/tmp/second.mp4"],
+                event_ids=["abc123"],
+                max_frames=2,
+                target_width=128,
+                include_filename=False,
+                expose_images=False,
+                save_clip=True,
+            )
+
+        saved = {
+            call.kwargs["video_path"]: call.kwargs["save_clip"]
+            for call in processor.add_video.await_args_list
+        }
+        assert saved == {
+            "/tmp/first.mp4": True,
+            "/tmp/second.mp4": False,
+            "/api/frigate/notifications/abc123/clip.mp4": False,
+        }
+
+    @pytest.mark.asyncio
+    async def test_add_videos_with_no_videos(self, processor):
+        with patch(
+            "custom_components.llmvision.media_handlers.get_url",
+            return_value="http://ha.local",
+        ):
+            result = await processor.add_videos(
+                video_paths=None,
+                event_ids=None,
+                max_frames=2,
+                target_width=128,
+                include_filename=False,
+                expose_images=False,
+                save_clip=True,
+            )
+
+        assert result is processor.client
+        assert processor.clip == ""

@@ -873,3 +873,200 @@ class TestSetupServices:
         hass.http.register_view.assert_any_call(init_module.TimelineEventsView)
         hass.http.register_view.assert_any_call(init_module.TimelineEventView)
         hass.http.register_view.assert_any_call(init_module.TimelineEventCreateView)
+
+
+class TestClips:
+    """save_clip on video_analyzer and clip_path on create_event."""
+
+    def test_service_call_data_clip_defaults(self):
+        call = ServiceCallData(_build_data_call(_base_service_data()))
+        assert call.save_clip is False
+        assert call.clip_path == ""
+
+    def test_service_call_data_clip_values(self):
+        call = ServiceCallData(
+            _build_data_call(
+                _base_service_data(
+                    save_clip=True, clip_path="/media/llmvision/clips/a.mp4"
+                )
+            )
+        )
+        assert call.save_clip is True
+        assert call.clip_path == "/media/llmvision/clips/a.mp4"
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize("store_in_timeline", [True, False])
+    async def test_video_analyzer_returns_and_stores_clip(self, store_in_timeline):
+        hass = _make_hass()
+        assert setup(hass, {}) is True
+        handlers = TestSetupServices()._registered_handlers(hass)
+
+        call_obj = ServiceCallData(
+            _build_data_call(
+                _base_service_data(save_clip=True, store_in_timeline=store_in_timeline)
+            )
+        )
+        request_obj = Mock()
+        request_obj.call = AsyncMock(return_value={"response_text": "ok"})
+        request_obj.get_default_model = Mock(return_value="gpt-4o")
+        request_cls = Mock(return_value=request_obj)
+        request_cls.get_provider = Mock(return_value="OpenAI")
+        memory_obj = Mock()
+        memory_obj._update_memory = AsyncMock()
+        processor = Mock()
+        processor.key_frame = "/media/llmvision/snapshots/k.jpg"
+        processor.clip = "/media/llmvision/clips/c.mp4"
+        processor.add_videos = AsyncMock(return_value=request_obj)
+
+        with (
+            patch("custom_components.llmvision.ServiceCallData", return_value=call_obj),
+            patch("custom_components.llmvision.Request", request_cls),
+            patch("custom_components.llmvision.MediaProcessor", return_value=processor),
+            patch("custom_components.llmvision.Memory", return_value=memory_obj),
+            patch(
+                "custom_components.llmvision._create_event", new=AsyncMock()
+            ) as create_event_mock,
+        ):
+            result = await handlers["video_analyzer"](
+                _build_data_call(_base_service_data())
+            )
+
+        assert processor.add_videos.await_args.kwargs["save_clip"] is True
+        assert result["clip"] == "/media/llmvision/clips/c.mp4"
+        assert result["key_frame"] == "/media/llmvision/snapshots/k.jpg"
+        assert (
+            create_event_mock.await_args.kwargs["clip"]
+            == "/media/llmvision/clips/c.mp4"
+        )
+
+    @pytest.mark.anyio
+    async def test_video_analyzer_without_clip_has_no_clip_field(self):
+        hass = _make_hass()
+        assert setup(hass, {}) is True
+        handlers = TestSetupServices()._registered_handlers(hass)
+
+        call_obj = ServiceCallData(_build_data_call(_base_service_data()))
+        request_obj = Mock()
+        request_obj.call = AsyncMock(return_value={"response_text": "ok"})
+        request_obj.get_default_model = Mock(return_value="gpt-4o")
+        request_cls = Mock(return_value=request_obj)
+        request_cls.get_provider = Mock(return_value="OpenAI")
+        memory_obj = Mock()
+        memory_obj._update_memory = AsyncMock()
+        processor = Mock()
+        processor.key_frame = ""
+        processor.clip = ""
+        processor.add_videos = AsyncMock(return_value=request_obj)
+
+        with (
+            patch("custom_components.llmvision.ServiceCallData", return_value=call_obj),
+            patch("custom_components.llmvision.Request", request_cls),
+            patch("custom_components.llmvision.MediaProcessor", return_value=processor),
+            patch("custom_components.llmvision.Memory", return_value=memory_obj),
+            patch("custom_components.llmvision._create_event", new=AsyncMock()),
+        ):
+            result = await handlers["video_analyzer"](
+                _build_data_call(_base_service_data())
+            )
+
+        assert processor.add_videos.await_args.kwargs["save_clip"] is False
+        assert "clip" not in result
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize(
+        ("clip", "stored"),
+        [("/media/llmvision/clips/c.mp4", "/media/llmvision/clips/c.mp4"), ("", None)],
+    )
+    async def test_create_event_helper_attaches_clip(self, clip, stored):
+        hass = _make_hass()
+        settings = Mock()
+        settings.data = {"provider": "Settings"}
+        hass.config_entries.async_entries.return_value = [settings]
+        timeline = Mock()
+        timeline.create_event = AsyncMock()
+        call = _DummyCall(store_in_timeline=True, video_paths=["/tmp/front.mp4"])
+
+        with patch("custom_components.llmvision.Timeline", return_value=timeline):
+            await _create_event(
+                hass,
+                call,
+                datetime.datetime.now(),
+                {"response_text": "x"},
+                "frame.jpg",
+                clip=clip,
+            )
+
+        assert timeline.create_event.await_args.kwargs["clip"] == stored
+
+    @staticmethod
+    def _create_event_setup(clip_path):
+        hass = _make_hass()
+        hass.async_add_executor_job = AsyncMock(
+            side_effect=lambda func, *args: func(*args)
+        )
+        assert setup(hass, {}) is True
+        handlers = TestSetupServices()._registered_handlers(hass)
+        settings = Mock()
+        settings.data = {"provider": "Settings"}
+        hass.config_entries.async_entries.return_value = [settings]
+        timeline = Mock()
+        timeline.create_event = AsyncMock()
+        call_obj = ServiceCallData(
+            _build_data_call(_base_service_data(clip_path=clip_path))
+        )
+        return handlers, timeline, call_obj
+
+    @pytest.mark.anyio
+    async def test_create_event_service_attaches_valid_clip(self):
+        handlers, timeline, call_obj = self._create_event_setup(
+            "/media/llmvision/clips/c.mp4"
+        )
+
+        with (
+            patch("custom_components.llmvision.ServiceCallData", return_value=call_obj),
+            patch("custom_components.llmvision.Timeline", return_value=timeline),
+            patch(
+                "custom_components.llmvision.validate_clip_path",
+                return_value="/media/llmvision/clips/c.mp4",
+            ) as validate,
+        ):
+            await handlers["create_event"](_build_data_call(_base_service_data()))
+
+        validate.assert_called_once_with("/media/llmvision/clips/c.mp4")
+        assert (
+            timeline.create_event.await_args.kwargs["clip"]
+            == "/media/llmvision/clips/c.mp4"
+        )
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize(
+        "clip_path",
+        [
+            "/config/secrets.yaml",
+            "/media/llmvision/clips/../../../config/events.mp4",
+            "/media/llmvision/snapshots/k.jpg",
+        ],
+    )
+    async def test_create_event_service_rejects_clip_outside_clips(self, clip_path):
+        handlers, timeline, call_obj = self._create_event_setup(clip_path)
+
+        with (
+            patch("custom_components.llmvision.ServiceCallData", return_value=call_obj),
+            patch("custom_components.llmvision.Timeline", return_value=timeline),
+            pytest.raises(ServiceValidationError, match="must be a file in"),
+        ):
+            await handlers["create_event"](_build_data_call(_base_service_data()))
+
+        timeline.create_event.assert_not_awaited()
+
+    @pytest.mark.anyio
+    async def test_create_event_service_without_clip(self):
+        handlers, timeline, call_obj = self._create_event_setup("")
+
+        with (
+            patch("custom_components.llmvision.ServiceCallData", return_value=call_obj),
+            patch("custom_components.llmvision.Timeline", return_value=timeline),
+        ):
+            await handlers["create_event"](_build_data_call(_base_service_data()))
+
+        assert timeline.create_event.await_args.kwargs["clip"] is None

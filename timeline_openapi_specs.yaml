@@ -52,6 +52,11 @@ components:
         key_frame:
           type: string
           example: /media/llmvision/snapshots/37ddf64a-0.jpg
+        clip:
+          type: string
+          nullable: true
+          description: Source video saved by video_analyzer with save_clip, or null.
+          example: /media/llmvision/clips/0c8f5d0e-5b1a-4d0e-9a51-1f2b3c4d5e6f.mp4
         camera_name:
           type: string
           example: camera.front_door

@@ -1,10 +1,14 @@
 """Unit tests for timeline.py module."""
 
+import asyncio
 import datetime
 import os
+import shutil
+import subprocess
 import uuid
 from functools import partial
-from unittest.mock import AsyncMock, Mock
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock, patch
 
 import aiosqlite
 import pytest
@@ -13,12 +17,17 @@ from custom_components.llmvision.const import (
     CONF_RETENTION_TIME,
     CONF_TIMELINE_LANGUAGE,
 )
+from custom_components.llmvision.media_handlers import MediaProcessor
 from custom_components.llmvision.timeline import (
+    CLIP_GRACE_SECONDS,
     DB_VERSION,
+    SNAPSHOT_GRACE_SECONDS,
     Event,
     Timeline,
     _get_category_and_label,
+    validate_clip_path,
 )
+from homeassistant.exceptions import ServiceValidationError
 from homeassistant.util import dt as dt_util
 
 # ---------------------------------------------------------------------------
@@ -1223,3 +1232,517 @@ class TestMigration:
         cleanup_mock.assert_awaited_once()
         assert await tl._get_db_version() == DB_VERSION
         assert not tl._migrating
+
+
+# ===========================================================================
+# Clips (source videos saved by video_analyzer)
+# ===========================================================================
+
+
+def _age(path, seconds: float) -> None:
+    """Set a file's mtime to `seconds` ago."""
+    ts = datetime.datetime.now().timestamp() - seconds
+    os.utime(str(path), (ts, ts))
+
+
+async def _insert_with_clip(db_path: str, clip, age_days: float = 0) -> str:
+    row = _make_row("A person walks by", age_days=age_days)
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute(
+            """INSERT INTO events
+                (uid, title, start, end, description, key_frame, camera_name, category, label, clip)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (*row, clip),
+        )
+        await db.commit()
+    return row[0]
+
+
+@pytest.fixture
+def clips_dir(tmp_path):
+    path = tmp_path / "clips"
+    path.mkdir()
+    return path
+
+
+@pytest.fixture
+def clip_timeline(build_timeline, clips_dir, tmp_path):
+    """Factory: a Timeline whose snapshot and clip dirs are under tmp_path."""
+
+    async def _build(**kwargs):
+        tl = build_timeline(**kwargs)
+        await tl._initialize_db()
+        snapshots = tmp_path / "snapshots"
+        snapshots.mkdir(exist_ok=True)
+        tl._media_path = str(snapshots)
+        tl._clips_path = str(clips_dir)
+        return tl
+
+    return _build
+
+
+class TestValidateClipPath:
+    def test_empty_returns_empty_string(self, clips_dir):
+        assert validate_clip_path("", str(clips_dir)) == ""
+        assert validate_clip_path(None, str(clips_dir)) == ""
+        assert validate_clip_path("   ", str(clips_dir)) == ""
+
+    def test_accepts_existing_clip_and_normalizes(self, clips_dir):
+        clip = clips_dir / "abc.mp4"
+        clip.write_bytes(b"video")
+        assert validate_clip_path(f" {clip} ", str(clips_dir)) == str(clip)
+        assert validate_clip_path(
+            f"{clips_dir}/../clips/abc.mp4", str(clips_dir)
+        ) == str(clip)
+
+    def test_accepts_other_video_extensions(self, clips_dir):
+        clip = clips_dir / "abc.MOV"
+        clip.write_bytes(b"video")
+        assert validate_clip_path(str(clip), str(clips_dir)) == str(clip)
+
+    def test_rejects_file_outside_clips_dir(self, clips_dir, tmp_path):
+        outside = tmp_path / "outside.mp4"
+        outside.write_bytes(b"video")
+        with pytest.raises(ServiceValidationError, match="must be a file in"):
+            validate_clip_path(str(outside), str(clips_dir))
+
+    def test_rejects_dot_dot_out_of_clips_dir(self, clips_dir, tmp_path):
+        (tmp_path / "outside.mp4").write_bytes(b"video")
+        with pytest.raises(ServiceValidationError, match="must be a file in"):
+            validate_clip_path(f"{clips_dir}/../outside.mp4", str(clips_dir))
+
+    def test_rejects_symlink_out_of_clips_dir(self, clips_dir, tmp_path):
+        target = tmp_path / "secret.mp4"
+        target.write_bytes(b"video")
+        (clips_dir / "link.mp4").symlink_to(target)
+        with pytest.raises(ServiceValidationError, match="must be a file in"):
+            validate_clip_path(str(clips_dir / "link.mp4"), str(clips_dir))
+
+    def test_rejects_relative_path(self, clips_dir):
+        with pytest.raises(ServiceValidationError, match="must be a file in"):
+            validate_clip_path("clips/abc.mp4", str(clips_dir))
+
+    def test_rejects_the_clips_dir_itself(self, clips_dir):
+        with pytest.raises(ServiceValidationError, match="must be a file in"):
+            validate_clip_path(str(clips_dir), str(clips_dir))
+
+    def test_rejects_non_video_extension(self, clips_dir):
+        (clips_dir / "abc.jpg").write_bytes(b"image")
+        with pytest.raises(ServiceValidationError, match="must end in"):
+            validate_clip_path(str(clips_dir / "abc.jpg"), str(clips_dir))
+
+    def test_rejects_missing_file(self, clips_dir):
+        with pytest.raises(ServiceValidationError, match="does not exist"):
+            validate_clip_path(str(clips_dir / "missing.mp4"), str(clips_dir))
+
+
+class TestEventClip:
+    async def test_create_event_stores_clip(self, clip_timeline, clips_dir):
+        tl = await clip_timeline()
+        clip = str(clips_dir / "abc.mp4")
+        now = dt_util.now()
+        await tl.create_event(
+            start=now,
+            end=now + datetime.timedelta(minutes=1),
+            title="Delivery",
+            description="A courier leaves a parcel.",
+            key_frame="",
+            camera_name="camera.front",
+            clip=clip,
+        )
+
+        events = await tl.get_events_json()
+        assert events[0]["clip"] == clip
+        assert (await tl.get_event(events[0]["uid"]))["clip"] == clip
+        await tl.load_events()
+        assert tl.events[0].clip == clip
+        assert tl._pending_key_frames == set()
+
+    async def test_event_without_clip_returns_none(self, clip_timeline):
+        tl = await clip_timeline()
+        now = dt_util.now()
+        await tl.create_event(
+            start=now,
+            end=now + datetime.timedelta(minutes=1),
+            title="Delivery",
+            description="",
+            key_frame="",
+            camera_name="",
+        )
+
+        events = await tl.get_events_json()
+        assert events[0]["clip"] is None
+        assert (await tl.get_event(events[0]["uid"]))["clip"] is None
+
+    async def test_update_event_keeps_clip(self, clip_timeline, clips_dir):
+        tl = await clip_timeline()
+        clip = str(clips_dir / "abc.mp4")
+        uid = await _insert_with_clip(tl._db_path, clip)
+        now = dt_util.now()
+        await tl.update_event(
+            uid=uid,
+            start=now,
+            end=now + datetime.timedelta(minutes=1),
+            title="Renamed",
+            description="",
+            key_frame="",
+            camera_name="",
+            label="",
+        )
+        assert (await tl.get_event(uid))["clip"] == clip
+
+    async def test_delete_event_removes_clip(self, clip_timeline, clips_dir):
+        tl = await clip_timeline()
+        clip = clips_dir / "abc.mp4"
+        clip.write_bytes(b"video")
+        uid = await _insert_with_clip(tl._db_path, str(clip))
+
+        assert await tl.delete_event(uid)
+
+        assert not clip.exists()
+        assert await tl.get_event(uid) is None
+
+    async def test_delete_event_with_missing_clip_file(self, clip_timeline, clips_dir):
+        tl = await clip_timeline()
+        uid = await _insert_with_clip(tl._db_path, str(clips_dir / "gone.mp4"))
+
+        assert await tl.delete_event(uid)
+        assert await tl.get_event(uid) is None
+
+    async def test_delete_event_never_removes_files_outside_clips_dir(
+        self, clip_timeline, tmp_path
+    ):
+        tl = await clip_timeline()
+        outside = tmp_path / "events.db.mp4"
+        outside.write_bytes(b"not a clip")
+        uid = await _insert_with_clip(tl._db_path, str(outside))
+
+        assert await tl.delete_event(uid)
+
+        assert outside.exists()
+        assert await tl.get_event(uid) is None
+
+    async def test_delete_event_with_null_key_frame(self, clip_timeline):
+        """A NULL key_frame no longer breaks deletion."""
+        tl = await clip_timeline()
+        row = list(_make_row("ev", age_days=0))
+        row[5] = None  # key_frame
+        await _insert_rows(tl._db_path, [tuple(row)])
+
+        assert await tl.delete_event(row[0])
+        assert await tl.get_event(row[0]) is None
+
+
+class TestClipCleanup:
+    async def test_removes_unlinked_clip_after_grace(self, clip_timeline, clips_dir):
+        tl = await clip_timeline()
+        orphan = clips_dir / "orphan.mp4"
+        orphan.write_bytes(b"video")
+        _age(orphan, CLIP_GRACE_SECONDS + 10)
+
+        await tl._cleanup()
+
+        assert not orphan.exists()
+
+    async def test_keeps_unlinked_clip_within_grace(self, clip_timeline, clips_dir):
+        """A clip waiting for create_event outlives the snapshot grace period."""
+        tl = await clip_timeline()
+        waiting = clips_dir / "waiting.mp4"
+        waiting.write_bytes(b"video")
+        _age(waiting, SNAPSHOT_GRACE_SECONDS + 60)
+
+        await tl._cleanup()
+
+        assert waiting.exists()
+
+    async def test_keeps_linked_clip(self, clip_timeline, clips_dir):
+        tl = await clip_timeline()
+        linked = clips_dir / "linked.mp4"
+        linked.write_bytes(b"video")
+        _age(linked, CLIP_GRACE_SECONDS + 10)
+        await _insert_with_clip(tl._db_path, str(linked))
+
+        await tl._cleanup()
+
+        assert linked.exists()
+
+    async def test_keeps_pending_clip(self, clip_timeline, clips_dir):
+        tl = await clip_timeline()
+        pending = clips_dir / "pending.mp4"
+        pending.write_bytes(b"video")
+        _age(pending, CLIP_GRACE_SECONDS + 10)
+        tl._pending_key_frames.add("pending.mp4")
+
+        await tl._cleanup()
+
+        assert pending.exists()
+
+    async def test_retention_removes_clip_of_expired_event(
+        self, clip_timeline, clips_dir
+    ):
+        tl = await clip_timeline(retention=7)
+        old_clip = clips_dir / "old.mp4"
+        new_clip = clips_dir / "new.mp4"
+        for clip in (old_clip, new_clip):
+            clip.write_bytes(b"video")
+            _age(clip, 10 * 24 * 3600)
+        await _insert_with_clip(tl._db_path, str(old_clip), age_days=10)
+        await _insert_with_clip(tl._db_path, str(new_clip), age_days=1)
+
+        await tl._cleanup()
+
+        assert not old_clip.exists()
+        assert new_clip.exists()
+        assert [e["clip"] for e in await tl.get_events_json()] == [str(new_clip)]
+
+    async def test_skipped_when_events_cannot_be_read(
+        self, clip_timeline, clips_dir, tmp_path
+    ):
+        """Unreadable events must not look like "nothing is linked"."""
+        tl = await clip_timeline()
+        clip = clips_dir / "linked.mp4"
+        snapshot = tmp_path / "snapshots" / "linked.jpg"
+        for path in (clip, snapshot):
+            path.write_bytes(b"data")
+            _age(path, CLIP_GRACE_SECONDS + 10)
+        async with aiosqlite.connect(tl._db_path) as db:
+            await db.execute("DROP TABLE events")
+            await db.commit()
+
+        await tl._cleanup()
+
+        assert clip.exists()
+        assert snapshot.exists()
+
+    async def test_missing_clips_dir_is_fine(self, clip_timeline, tmp_path):
+        tl = await clip_timeline()
+        tl._clips_path = str(tmp_path / "no-such-dir")
+        await tl._cleanup()
+
+
+class TestClipMigration:
+    @staticmethod
+    async def _make_v4_db(db_path: str) -> str:
+        """Replace the events table with the v4 schema (no clip) holding one row."""
+        row = _make_row("A car passed", age_days=0, label="car", category="vehicle")
+        async with aiosqlite.connect(db_path) as db:
+            await db.execute("DROP TABLE events")
+            await db.execute("""CREATE TABLE events (
+                    uid TEXT PRIMARY KEY, title TEXT, start TEXT, end TEXT,
+                    description TEXT, key_frame TEXT, camera_name TEXT,
+                    category TEXT, label TEXT
+                )""")
+            await db.execute(
+                "INSERT INTO events VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", row
+            )
+            await db.execute("PRAGMA user_version = 4")
+            await db.commit()
+        return row[0]
+
+    async def test_v4_db_gains_clip_column(self, build_timeline):
+        tl = build_timeline()
+        await tl._initialize_db()
+        uid = await self._make_v4_db(tl._db_path)
+        assert not await tl._has_latest_schema()
+
+        tl._migrating = True
+        await tl._migrate()
+
+        assert await tl._has_latest_schema()
+        assert await tl._get_db_version() == DB_VERSION == 5
+        event = await tl.get_event(uid)
+        assert event["title"] == "A car passed"
+        assert event["clip"] is None
+
+    async def test_v4_db_skips_older_steps(self, build_timeline):
+        tl = build_timeline()
+        await tl._initialize_db()
+        await self._make_v4_db(tl._db_path)
+        tl._migrate_to_v4 = AsyncMock()
+
+        tl._migrating = True
+        await tl._migrate()
+
+        tl._migrate_to_v4.assert_not_awaited()
+        assert await tl._has_latest_schema()
+
+    async def test_old_db_runs_older_steps_then_adds_clip(self, build_timeline):
+        tl = build_timeline()
+        await tl._initialize_db()
+        await self._make_v4_db(tl._db_path)
+        await tl._set_db_version(3)
+
+        tl._migrating = True
+        await tl._migrate()
+
+        assert await tl._has_latest_schema()
+        assert await tl._get_db_version() == DB_VERSION
+
+    async def test_concurrent_timelines_migrate_once(self, build_timeline, caplog):
+        """Timelines are created per request; their migrations must not collide."""
+        tl_a = build_timeline()
+        await tl_a._initialize_db()
+        await self._make_v4_db(tl_a._db_path)
+        tl_b = Timeline(tl_a.hass, tl_a._config_entry)
+        add_column_calls = []
+        real_migrate_to_v5 = Timeline._migrate_to_v5
+
+        async def counting_migrate_to_v5(self):
+            add_column_calls.append(self)
+            await real_migrate_to_v5(self)
+
+        tl_a._migrate_to_v5 = partial(counting_migrate_to_v5, tl_a)
+        tl_b._migrate_to_v5 = partial(counting_migrate_to_v5, tl_b)
+
+        await asyncio.gather(tl_a._migrate(), tl_b._migrate())
+
+        assert len(add_column_calls) == 1
+        assert await tl_a._has_latest_schema()
+        assert not [r for r in caplog.records if r.levelname == "ERROR"]
+
+    async def test_startup_migrates_before_loading(self, build_timeline, caplog):
+        """Loading events on startup reads the clip column only once it exists."""
+        tl = build_timeline()
+        await tl._initialize_db()
+        uid = await self._make_v4_db(tl._db_path)
+        tl._migrating = True
+
+        await tl._startup()
+
+        assert [e.uid for e in tl.events] == [uid]
+        assert tl.events[0].clip is None
+        assert not [r for r in caplog.records if r.levelname == "ERROR"]
+
+
+
+@pytest.mark.skipif(not shutil.which("ffmpeg"), reason="needs ffmpeg")
+class TestClipEndToEnd:
+    """video_analyzer(save_clip) on a remote mp4, then create_event(clip_path)."""
+
+    @staticmethod
+    def _make_mp4(path) -> bytes:
+        subprocess.run(
+            [
+                "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=10:duration=3",
+                "-c:v", "libx264", "-g", "10", str(path),
+            ],
+            check=True,
+        )
+        return path.read_bytes()
+
+    @staticmethod
+    async def _analyze_remote(source_bytes: bytes, clips_dir) -> MediaProcessor:
+        """Run add_video on a remote URL whose response is source_bytes."""
+        hass = Mock()
+        hass.loop = Mock()
+
+        async def run_in_executor(_executor, func, *args):
+            return func(*args)
+
+        hass.loop.run_in_executor = run_in_executor
+        client = Mock()
+        with patch(
+            "custom_components.llmvision.media_handlers.async_get_clientsession"
+        ) as session_factory:
+            processor = MediaProcessor(hass, client)
+        processor.clips_path = str(clips_dir)
+
+        # The download arrives in chunks, like aiohttp's iter_any
+        chunks = [source_bytes[i : i + 4096] for i in range(0, len(source_bytes), 4096)]
+
+        class Content:
+            async def iter_any(self):
+                for chunk in chunks:
+                    yield chunk
+
+        class ResponseContext:
+            async def __aenter__(self):
+                return SimpleNamespace(ok=True, status=200, content=Content())
+
+            async def __aexit__(self, *exc):
+                return False
+
+        class Writer:
+            def __init__(self, path):
+                self._file = open(path, "wb")
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                self._file.close()
+
+            async def write(self, data):
+                self._file.write(data)
+
+        session_factory.return_value.get = Mock(return_value=ResponseContext())
+        processor.session = session_factory.return_value
+        with patch(
+            "custom_components.llmvision.media_handlers.async_open",
+            side_effect=lambda path, mode: Writer(path),
+        ):
+            await processor.add_video(
+                video_path="https://ring.example/recordings/front.mp4?sig=abc",
+                base_url="http://ha.local",
+                max_frames=2,
+                target_width=320,
+                save_clip=True,
+            )
+        assert client.add_frame.call_count >= 1
+        return processor
+
+    async def test_clip_saved_attached_and_deleted_with_event(
+        self, clip_timeline, clips_dir, tmp_path
+    ):
+        source_bytes = self._make_mp4(tmp_path / "source.mp4")
+        processor = await self._analyze_remote(source_bytes, clips_dir)
+
+        # The clip is in the clips dir at the original quality
+        clip = processor.clip
+        assert os.path.dirname(clip) == str(clips_dir)
+        with open(clip, "rb") as f:
+            assert f.read() == source_bytes
+
+        # create_event(clip_path=...) accepts it
+        tl = await clip_timeline()
+        assert validate_clip_path(clip, str(clips_dir)) == clip
+        now = dt_util.now()
+        await tl.create_event(
+            start=now,
+            end=now + datetime.timedelta(minutes=1),
+            title="Person at the door",
+            description="",
+            key_frame="",
+            camera_name="camera.front",
+            clip=clip,
+        )
+        [event] = await tl.get_events_json()
+        assert event["clip"] == clip
+
+        # A sweep keeps it; deleting the event removes it
+        await tl._cleanup()
+        assert os.path.exists(clip)
+        await tl.delete_event(event["uid"])
+        assert not os.path.exists(clip)
+
+    async def test_clip_removed_by_retention(self, clip_timeline, clips_dir, tmp_path):
+        source_bytes = self._make_mp4(tmp_path / "source.mp4")
+        processor = await self._analyze_remote(source_bytes, clips_dir)
+        tl = await clip_timeline(retention=7)
+        start = dt_util.now() - datetime.timedelta(days=8)
+        await tl.create_event(
+            start=start,
+            end=start + datetime.timedelta(minutes=1),
+            title="Person at the door",
+            description="",
+            key_frame="",
+            camera_name="camera.front",
+            clip=processor.clip,
+        )
+        _age(processor.clip, 8 * 24 * 3600)
+
+        await tl._cleanup()
+
+        assert not os.path.exists(processor.clip)
+        assert await tl.get_events_json() == []

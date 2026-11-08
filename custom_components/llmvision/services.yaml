@@ -296,6 +296,20 @@ video_analyzer:
       default: false
       selector:
         boolean:
+    save_clip:
+      name: Save Clip
+      description: >-
+        Keep the source video in /media/llmvision/clips/ at its original
+        quality. The path is returned as "clip". With Store in Timeline, the
+        clip is attached to the event, and the timeline card plays it. Pass it
+        to create_event as clip_path otherwise; a clip no event uses is deleted
+        after an hour. Clips are deleted with their events. With several
+        videos, only the first is kept.
+      required: false
+      example: true
+      default: false
+      selector:
+        boolean:
     response_format:
       name: Response Format
       description: Format of the response - text for natural language or json for structured data
@@ -663,6 +677,17 @@ create_event:
       required: false
       description: Image of the event. Must be stored in "/media/llmvision/snapshots/"
       example: '/media/llmvision/snapshots/example.jpg'
+      selector:
+        text:
+          multiline: false
+    clip_path:
+      name: Clip Path
+      required: false
+      description: >-
+        Video of the event, as returned in "clip" by video_analyzer with Save
+        Clip. Must be a file in "/media/llmvision/clips/". It is deleted with
+        the event.
+      example: '/media/llmvision/clips/0c8f5d0e-5b1a-4d0e-9a51-1f2b3c4d5e6f.mp4'
       selector:
         text:
           multiline: false

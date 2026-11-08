@@ -1,6 +1,7 @@
 import base64
 import io
 import os
+import shutil
 import uuid
 import logging
 import time
@@ -22,7 +23,13 @@ import numpy as np
 from homeassistant.helpers.network import get_url
 from homeassistant.exceptions import ServiceValidationError
 
-from .const import DOMAIN, FPS_MODE_CONSTANT, FPS_MODE_VARIABLE
+from .const import (
+    DOMAIN,
+    FPS_MODE_CONSTANT,
+    FPS_MODE_VARIABLE,
+    CLIPS_DIR,
+    CLIP_EXTENSIONS,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -43,6 +50,27 @@ def _read_file(path):
         return f.read()
 
 
+def _store_clip(source, destination, move):
+    """Move or copy source to destination, leaving nothing behind on failure.
+
+    The mtime is set to now: _cleanup's grace period for unlinked clips
+    starts when the clip is saved, not when the source was recorded.
+    """
+    os.makedirs(os.path.dirname(destination), exist_ok=True)
+    try:
+        if move:
+            shutil.move(source, destination)
+        else:
+            shutil.copyfile(source, destination)
+        os.utime(destination)
+    except Exception:
+        try:
+            os.remove(destination)
+        except OSError:
+            pass
+        raise
+
+
 class MediaProcessor:
     def __init__(self, hass, client):
         self.hass = hass
@@ -52,6 +80,9 @@ class MediaProcessor:
         self.filenames = []
         self.snapshots_path = f"/media/{DOMAIN}/snapshots/"
         self.key_frame = ""
+        self.clips_path = CLIPS_DIR
+        # Path of the source video saved by add_video(save_clip=True)
+        self.clip = ""
 
     async def _encode_image(self, img):
         """Encode image as base64"""
@@ -698,6 +729,27 @@ class MediaProcessor:
             except OSError:
                 pass
 
+    async def _save_source_clip(self, source, uid, move):
+        """Keep source in clips_path as <uid><ext> and set self.clip.
+
+        The video is not re-encoded. Returns whether it was saved; a failure
+        is logged and leaves the analysis to go on without a clip.
+        """
+        ext = os.path.splitext(source)[1].lower()
+        if ext not in CLIP_EXTENSIONS:
+            ext = ".mp4"
+        destination = os.path.join(self.clips_path, f"{uid}{ext}")
+        try:
+            await self.hass.loop.run_in_executor(
+                None, _store_clip, source, destination, move
+            )
+        except Exception as e:
+            _LOGGER.error(f"Could not save clip {source} to {destination}: {e}")
+            return False
+        _LOGGER.info(f"Saved clip {destination}")
+        self.clip = destination
+        return True
+
     async def add_video(
         self,
         video_path,
@@ -709,6 +761,7 @@ class MediaProcessor:
         fps_mode=FPS_MODE_VARIABLE,
         fps=1,
         encode_video=False,
+        save_clip=False,
     ):
         """Add frames from a video to the client.
 
@@ -718,6 +771,9 @@ class MediaProcessor:
         max_frames; the rest of the video is not used. With encode_video,
         those frames are also attached as a video, for providers that take
         video natively.
+        With save_clip, the source video is kept as it is in clips_path and
+        its path set as self.clip: a downloaded copy is moved there, a local
+        file is copied.
         """
         temp_file_path = None
         try:
@@ -1044,6 +1100,16 @@ class MediaProcessor:
                         ),
                         fps=fps,
                     )
+
+            if save_clip:
+                downloaded = temp_file_path is not None
+                if await self._save_source_clip(
+                    source=temp_file_path if downloaded else video_path,
+                    uid=current_event_id,
+                    move=downloaded,
+                ):
+                    # The download is the saved clip now
+                    temp_file_path = None
         except Exception as e:
             raise ServiceValidationError(f"Error processing video {video_path}: {e}")
         finally:
@@ -1065,8 +1131,12 @@ class MediaProcessor:
         fps_mode=FPS_MODE_VARIABLE,
         fps=1,
         encode_video=False,
+        save_clip=False,
     ):
-        """Wrapper for client.add_frame for videos"""
+        """Wrapper for client.add_frame for videos.
+
+        With save_clip, only the first video is kept (see add_video).
+        """
 
         if not video_paths:
             video_paths = []
@@ -1081,7 +1151,7 @@ class MediaProcessor:
 
         _LOGGER.debug(f"Processing videos: {video_paths}")
 
-        def process_video(video_path):
+        def process_video(index, video_path):
             return self.add_video(
                 video_path=video_path,
                 base_url=base_url,
@@ -1092,10 +1162,13 @@ class MediaProcessor:
                 fps_mode=fps_mode,
                 fps=fps,
                 encode_video=encode_video,
+                save_clip=save_clip and index == 0,
             )
 
         # Process videos in parallel
-        await asyncio.gather(*map(process_video, video_paths))
+        await asyncio.gather(
+            *(process_video(index, path) for index, path in enumerate(video_paths))
+        )
 
         return self.client
 

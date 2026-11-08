@@ -1,5 +1,5 @@
 from datetime import datetime
-from .timeline import Timeline
+from .timeline import Timeline, validate_clip_path
 from .providers import ProviderFactory, Request
 from .memory import Memory
 from .media_handlers import MediaProcessor
@@ -58,6 +58,8 @@ from .const import (
     FPS_MODE,
     FPS_MODE_CONSTANT,
     FPS_MODE_VARIABLE,
+    SAVE_CLIP,
+    CLIP_PATH,
     INCLUDE_FILENAME,
     EXPOSE_IMAGES,
     GENERATE_TITLE,
@@ -493,6 +495,8 @@ class ServiceCallData:
         self.max_tokens: int = int(data_call.data.get(MAXTOKENS, 3000))
         self.include_filename: bool = data_call.data.get(INCLUDE_FILENAME, False)
         self.expose_images: bool = data_call.data.get(EXPOSE_IMAGES, False)
+        # video_analyzer: keep the source video for the timeline
+        self.save_clip: bool = bool(data_call.data.get(SAVE_CLIP, False))
         self.generate_title: bool = data_call.data.get(GENERATE_TITLE, False)
         self.sensor_entity: str = data_call.data.get(SENSOR_ENTITY, "")
         self.response_format: str = data_call.data.get(RESPONSE_FORMAT, "text")
@@ -515,6 +519,7 @@ class ServiceCallData:
         )
         self.end_time = self._convert_time_input_to_datetime(self.end_time)
         self.image_path: str = data_call.data.get("image_path", "")
+        self.clip_path: str = str(data_call.data.get(CLIP_PATH) or "")
         self.camera_entity: str = data_call.data.get("camera_entity", "")
         self.label: str = data_call.data.get("label", "")
 
@@ -574,6 +579,7 @@ async def _create_event(
     start: datetime,
     response: dict,
     key_frame: str,
+    clip: str = "",
 ) -> None:
     if call.get("store_in_timeline"):
         # Find timeline config
@@ -624,6 +630,7 @@ async def _create_event(
             key_frame=key_frame,
             camera_name=camera_name,
             label="",
+            clip=clip or None,
         )
         async_dispatcher_send(hass, SIGNAL_TIMELINE_UPDATED)
 
@@ -776,6 +783,7 @@ def setup(hass, config):
             fps_mode=call.fps_mode,
             fps=call.fps,
             encode_video=encode_video,
+            save_clip=call.save_clip,
         )
         call.memory = Memory(hass)
         await call.memory._update_memory()
@@ -784,6 +792,8 @@ def setup(hass, config):
         # Add processor.key_frame to response if it exists
         if processor.key_frame:
             response["key_frame"] = processor.key_frame
+        if processor.clip:
+            response["clip"] = processor.clip
 
         await _create_event(
             hass=hass,
@@ -791,6 +801,7 @@ def setup(hass, config):
             start=start,
             response=response,
             key_frame=processor.key_frame,
+            clip=processor.clip,
         )
         return response
 
@@ -924,6 +935,10 @@ def setup(hass, config):
         """Handle the service call to create an event"""
         start = dt_util.now()
         call = ServiceCallData(data_call).get_service_call_data()
+        clip = ""
+        if call.clip_path:
+            # Same rules as a clip saved by video_analyzer: in /media/llmvision/clips/
+            clip = await hass.async_add_executor_job(validate_clip_path, call.clip_path)
 
         # Find timeline config
         config_entry = None
@@ -948,6 +963,7 @@ def setup(hass, config):
             key_frame=call.image_path,
             camera_name=call.camera_entity,
             label=call.label.lower(),
+            clip=clip or None,
         )
         async_dispatcher_send(hass, SIGNAL_TIMELINE_UPDATED)
 
