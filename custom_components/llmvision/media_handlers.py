@@ -22,7 +22,7 @@ import numpy as np
 from homeassistant.helpers.network import get_url
 from homeassistant.exceptions import ServiceValidationError
 
-from .const import DOMAIN, FPS_MODE_CONSTANT, FPS_MODE_VARIABLE, MAX_INLINE_VIDEO_BYTES
+from .const import DOMAIN, FPS_MODE_CONSTANT, FPS_MODE_VARIABLE
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -1034,23 +1034,16 @@ class MediaProcessor:
                     fps=fps,
                 )
                 if video_bytes:
-                    base64_video = base64.b64encode(video_bytes).decode("utf-8")
-                    if len(base64_video) > MAX_INLINE_VIDEO_BYTES:
-                        _LOGGER.warning(
-                            f"Encoded video is {len(base64_video) / 1_048_576:.1f} MB "
-                            f"after base64, over the {MAX_INLINE_VIDEO_BYTES / 1_048_576:.0f} MB "
-                            "inline limit; sending images instead"
-                        )
-                    else:
-                        self.client.add_video_clip(
-                            base64_video=base64_video,
-                            filename=(
-                                os.path.splitext(os.path.basename(video_path))[0]
-                                if include_filename
-                                else ""
-                            ),
-                            fps=fps,
-                        )
+                    # The provider decides how to send it (inline or uploaded)
+                    self.client.add_video_clip(
+                        video_bytes=video_bytes,
+                        filename=(
+                            os.path.splitext(os.path.basename(video_path))[0]
+                            if include_filename
+                            else ""
+                        ),
+                        fps=fps,
+                    )
         except Exception as e:
             raise ServiceValidationError(f"Error processing video {video_path}: {e}")
         finally:

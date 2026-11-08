@@ -6,11 +6,13 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.core import HomeAssistant
 from functools import partial
 from typing import Any, cast
+import asyncio
 import logging
 import inspect
 import re
 import json
 import base64
+import time
 from .const import (
     DOMAIN,
     CONF_API_KEY,
@@ -31,6 +33,8 @@ from .const import (
     ENDPOINT_AZURE,
     ENDPOINT_ANTHROPIC,
     ENDPOINT_GOOGLE,
+    ENDPOINT_GOOGLE_FILE,
+    ENDPOINT_GOOGLE_UPLOAD,
     ENDPOINT_LOCALAI,
     ENDPOINT_OLLAMA,
     ENDPOINT_OPENWEBUI,
@@ -65,6 +69,7 @@ from .const import (
     DEFAULT_SYSTEM_PROMPT,
     DEFAULT_TITLE_PROMPT,
     GLIMPSE_V1_INSTRUCTIONS,
+    MAX_INLINE_VIDEO_BYTES,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -309,7 +314,7 @@ class Request:
         self.base64_images.append(base64_image)
         self.filenames.append(filename)
 
-    def add_video_clip(self, base64_video, filename, fps, mime_type="video/mp4"):
+    def add_video_clip(self, video_bytes, filename, fps, mime_type="video/mp4"):
         """Attach a video for providers that accept video natively.
 
         Frames added with add_frame are still required: providers without
@@ -317,7 +322,7 @@ class Request:
         """
         self.videos.append(
             {
-                "data": base64_video,
+                "data": video_bytes,
                 "filename": filename,
                 "fps": fps,
                 "mime_type": mime_type,
@@ -422,6 +427,11 @@ class Request:
             return healed[idx:end_idx]
 
         return text
+
+
+def _base64_length(data: bytes) -> int:
+    """Length of data once base64 encoded."""
+    return 4 * ((len(data) + 2) // 3)
 
 
 class Provider(ABC):
@@ -1344,7 +1354,156 @@ class Google(Provider):
             raise e
         return response_text
 
-    def _prepare_vision_data(self, call: Any) -> dict:
+    async def vision_request(self, call: Any) -> str:
+        # Videos too large to send inline are uploaded first, then deleted
+        uploaded_files: dict[int, dict] = {}
+        try:
+            if self.supports_video_input(self.model):
+                for index, video in enumerate(getattr(call, "videos", None) or []):
+                    if _base64_length(video["data"]) <= MAX_INLINE_VIDEO_BYTES:
+                        continue
+                    try:
+                        uploaded_files[index] = await self._upload_video(video)
+                    except Exception as e:
+                        # _prepare_vision_data falls back to images
+                        _LOGGER.warning(
+                            f"Could not upload video to the Gemini Files API; sending images instead: {e}"
+                        )
+                        break
+            data = self._prepare_vision_data(call, uploaded_files)
+            return await self._make_request(data)
+        finally:
+            for file in uploaded_files.values():
+                await self._delete_file(file["name"])
+
+    async def _upload_video(self, video: dict) -> dict:
+        """Upload a video with the Gemini Files API and wait until it can be used.
+
+        Returns the File resource. Raises if the upload or processing fails,
+        after deleting whatever was uploaded.
+        """
+        data = video["data"]
+        timeout = ClientTimeout(total=self.request_timeout)
+        auth = {"x-goog-api-key": self.api_key}
+        _LOGGER.debug(f"Uploading {len(data)} byte video to the Gemini Files API")
+        async with self.session.post(
+            ENDPOINT_GOOGLE_UPLOAD,
+            headers={
+                **auth,
+                "X-Goog-Upload-Protocol": "resumable",
+                "X-Goog-Upload-Command": "start",
+                "X-Goog-Upload-Header-Content-Length": str(len(data)),
+                "X-Goog-Upload-Header-Content-Type": video["mime_type"],
+            },
+            json={"file": {"display_name": video.get("filename") or "llmvision"}},
+            timeout=timeout,
+        ) as response:
+            if response.status != 200:
+                raise ServiceValidationError(
+                    f"upload start failed: {await self._resolve_error(response, 'google')}"
+                )
+            upload_url = response.headers.get("X-Goog-Upload-URL")
+        if not upload_url:
+            raise ServiceValidationError("upload start returned no upload URL")
+
+        async with self.session.post(
+            upload_url,
+            headers={
+                "X-Goog-Upload-Offset": "0",
+                "X-Goog-Upload-Command": "upload, finalize",
+            },
+            data=data,
+            timeout=timeout,
+        ) as response:
+            if response.status != 200:
+                raise ServiceValidationError(
+                    f"upload failed: {await self._resolve_error(response, 'google')}"
+                )
+            file = (await response.json())["file"]
+
+        try:
+            # Videos are processed before they can be used
+            deadline = time.monotonic() + self.request_timeout
+            while file.get("state") == "PROCESSING":
+                if time.monotonic() > deadline:
+                    raise ServiceValidationError(
+                        f"video still processing after {self.request_timeout} seconds"
+                    )
+                await asyncio.sleep(1)
+                async with self.session.get(
+                    ENDPOINT_GOOGLE_FILE.format(name=file["name"]),
+                    headers=auth,
+                    timeout=timeout,
+                ) as response:
+                    if response.status != 200:
+                        raise ServiceValidationError(
+                            f"could not check video state: {await self._resolve_error(response, 'google')}"
+                        )
+                    file = await response.json()
+            if file.get("state") != "ACTIVE":
+                error = file.get("error") or {}
+                raise ServiceValidationError(
+                    f"video processing ended in state {file.get('state')}: {error.get('message', '')}".rstrip(": ")
+                )
+        except Exception:
+            await self._delete_file(file["name"])
+            raise
+        _LOGGER.debug(f"Uploaded video as {file['name']}")
+        return file
+
+    async def _delete_file(self, name: str) -> None:
+        """Delete an uploaded file now rather than leaving it for 48 hours."""
+        try:
+            async with self.session.delete(
+                ENDPOINT_GOOGLE_FILE.format(name=name),
+                headers={"x-goog-api-key": self.api_key},
+                timeout=ClientTimeout(total=self.request_timeout),
+            ) as response:
+                if response.status != 200:
+                    _LOGGER.warning(
+                        f"Could not delete {name} from the Gemini Files API (it expires "
+                        f"after 48 hours): {await self._resolve_error(response, 'google')}"
+                    )
+        except Exception as e:
+            _LOGGER.warning(
+                f"Could not delete {name} from the Gemini Files API (it expires after 48 hours): {e}"
+            )
+
+    def _video_parts(self, call: Any, uploaded_files: dict) -> list | None:
+        """Parts for call.videos, or None when images should be sent instead."""
+        videos = getattr(call, "videos", None) or []
+        if not videos or not self.supports_video_input(self.model):
+            return None
+        parts = []
+        for index, video in enumerate(videos):
+            if index in uploaded_files:
+                media = {
+                    "file_data": {
+                        "mime_type": video["mime_type"],
+                        "file_uri": uploaded_files[index]["uri"],
+                    }
+                }
+            elif _base64_length(video["data"]) <= MAX_INLINE_VIDEO_BYTES:
+                media = {
+                    "inline_data": {
+                        "mime_type": video["mime_type"],
+                        "data": base64.b64encode(video["data"]).decode("utf-8"),
+                    }
+                }
+            else:
+                # Too large to send inline, and the upload failed
+                return None
+            # Gemini samples video at 1 fps unless told otherwise
+            if video.get("fps") and video["fps"] != 1:
+                media["video_metadata"] = {"fps": video["fps"]}
+            tag = video.get("filename") or f"Video {index + 1}"
+            parts += [{"text": tag + ":"}, media]
+        return parts
+
+    def _prepare_vision_data(
+        self, call: Any, uploaded_files: dict | None = None
+    ) -> dict:
+        """Build the request. uploaded_files maps call.videos indexes to Files API files."""
         default_parameters = self._get_default_parameters(call)
         payload = {
             "contents": [{"role": "user", "parts": []}],
@@ -1381,22 +1540,10 @@ class Google(Provider):
                 raise ServiceValidationError(
                     f"Invalid JSON in structure parameter: {str(e)}"
                 )
-        videos = getattr(call, "videos", None) or []
-        if videos and self.supports_video_input(self.model):
-            # Send the clip itself; the extracted frames would only duplicate it
-            for index, video in enumerate(videos, start=1):
-                tag = video.get("filename") or f"Video {index}"
-                video_part = {
-                    "inline_data": {
-                        "mime_type": video["mime_type"],
-                        "data": video["data"],
-                    }
-                }
-                # Gemini samples video at 1 fps unless told otherwise
-                if video.get("fps") and video["fps"] != 1:
-                    video_part["video_metadata"] = {"fps": video["fps"]}
-                payload["contents"][0]["parts"].append({"text": tag + ":"})
-                payload["contents"][0]["parts"].append(video_part)
+        video_parts = self._video_parts(call, uploaded_files or {})
+        if video_parts:
+            # Send the video itself; the extracted frames would only duplicate it
+            payload["contents"][0]["parts"].extend(video_parts)
         else:
             for image, filename in zip(call.base64_images, call.filenames):
                 tag = (

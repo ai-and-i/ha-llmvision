@@ -85,7 +85,8 @@ EXPOSE_IMAGES = "expose_images"
 GENERATE_TITLE = "generate_title"
 SENSOR_ENTITY = "sensor_entity"
 
-# Largest base64 video sent inline; Gemini advises inline requests stay under 20 MB
+# Largest base64 video sent inline; Gemini advises inline requests stay under
+# 20 MB. Larger videos are uploaded with the Gemini Files API.
 MAX_INLINE_VIDEO_BYTES = 18 * 1024 * 1024
 
 # Error messages
@@ -162,6 +163,8 @@ DEFAULT_SUMMARY_PROMPT = "Provide a brief summary for the following titles. Focu
 ENDPOINT_OPENAI = "https://api.openai.com/v1/chat/completions"
 ENDPOINT_ANTHROPIC = "https://api.anthropic.com/v1/messages"
 ENDPOINT_GOOGLE = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+ENDPOINT_GOOGLE_UPLOAD = "https://generativelanguage.googleapis.com/upload/v1beta/files"
+ENDPOINT_GOOGLE_FILE = "https://generativelanguage.googleapis.com/v1beta/{name}"  # name: "files/<id>"
 ENDPOINT_GROQ = "https://api.groq.com/openai/v1/chat/completions"
 ENDPOINT_LOCALAI = "{protocol}://{ip_address}:{port}/v1/chat/completions"
 ENDPOINT_OLLAMA = "{protocol}://{ip_address}:{port}/api/chat"

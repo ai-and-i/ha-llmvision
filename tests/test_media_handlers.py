@@ -879,9 +879,7 @@ class TestMediaProcessor:
         # The raw ffmpeg JPEGs, not the resized base64 images
         processor._encode_video.assert_awaited_once_with(jpeg_frames=frames, fps=2)
         processor.client.add_video_clip.assert_called_once_with(
-            base64_video=base64.b64encode(b"mp4-bytes").decode("utf-8"),
-            filename="front_door",
-            fps=2,
+            video_bytes=b"mp4-bytes", filename="front_door", fps=2
         )
         # Images are still added for providers without video support
         assert processor.client.add_frame.call_count == 2
@@ -926,29 +924,6 @@ class TestMediaProcessor:
 
         processor.client.add_video_clip.assert_not_called()
         processor.client.add_frame.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_add_video_skips_clip_over_inline_limit(self, processor):
-        """A clip too large to send inline is dropped in favour of the images."""
-        self._run_executor_inline(processor)
-        processor.resize_image = AsyncMock(return_value="encoded-frame")
-        processor._encode_video = AsyncMock(return_value=b"x" * 30)
-
-        with patch(
-            "custom_components.llmvision.media_handlers.MAX_INLINE_VIDEO_BYTES", 32
-        ), patch(
-            "custom_components.llmvision.media_handlers.asyncio.create_subprocess_exec",
-            AsyncMock(return_value=self._fake_ffmpeg(_make_jpeg_bytes("black"))),
-        ):
-            # 30 bytes is 40 characters of base64
-            await processor.add_video(
-                video_path="/tmp/clip.mp4",
-                base_url="http://ha.local",
-                fps_mode="constant",
-                encode_video=True,
-            )
-
-        processor.client.add_video_clip.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_add_video_removes_downloaded_copy(self, processor, tmp_path):
@@ -1062,7 +1037,7 @@ class TestMediaProcessor:
         assert sizes == {(640, 360)}
 
         output = tmp_path / "output.mp4"
-        output.write_bytes(base64.b64decode(clips[0]["base64_video"]))
+        output.write_bytes(clips[0]["video_bytes"])
         probe = subprocess.run(
             [
                 "ffprobe", "-v", "error",

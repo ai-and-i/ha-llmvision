@@ -2849,8 +2849,9 @@ async def test_request_call_title_message_does_not_repeat_title_prompt(
 
 
 
-def _video(fps=1, filename=""):
-    return {"data": "dmlk", "filename": filename, "fps": fps, "mime_type": "video/mp4"}
+def _video(fps=1, filename="", data=b"vid"):
+    # b"vid" is "dmlk" in base64
+    return {"data": data, "filename": filename, "fps": fps, "mime_type": "video/mp4"}
 
 
 def _inline_parts(payload):
@@ -2926,10 +2927,10 @@ def test_provider_factory_supports_video_input(provider_name, model, expected):
 def test_request_add_video_clip(coverage_hass):
     req = Request(coverage_hass, "m", 10, 0.2)
 
-    req.add_video_clip(base64_video="dmlk", filename="cam", fps=1)
+    req.add_video_clip(video_bytes=b"vid", filename="cam", fps=1)
 
     assert req.videos == [
-        {"data": "dmlk", "filename": "cam", "fps": 1, "mime_type": "video/mp4"}
+        {"data": b"vid", "filename": "cam", "fps": 1, "mime_type": "video/mp4"}
     ]
 
 
@@ -2944,7 +2945,7 @@ async def test_request_call_passes_videos_to_provider(monkeypatch, coverage_hass
 
     req = Request(coverage_hass, "m", 10, 0.2)
     req.add_frame("aW1n", "Video frame 1")
-    req.add_video_clip(base64_video="dmlk", filename="", fps=1)
+    req.add_video_clip(video_bytes=b"vid", filename="", fps=1)
     monkeypatch.setattr(
         ProviderFactory, "create", lambda **kwargs: CapturingProvider()
     )
@@ -2952,6 +2953,188 @@ async def test_request_call_passes_videos_to_provider(monkeypatch, coverage_hass
     await req.call(make_coverage_call())
 
     assert seen["videos"] == [_video()]
+
+
+
+class _FakeResponse:
+    """aiohttp-style response usable as an async context manager."""
+
+    def __init__(self, status=200, json_data=None, headers=None):
+        self.status = status
+        self.headers = headers or {}
+        self._json = json_data or {}
+
+    async def json(self):
+        return self._json
+
+    async def text(self):
+        return json.dumps(self._json)
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+class _FakeFilesSession:
+    """Records Files API calls and replies from per-method queues."""
+
+    def __init__(self, posts=(), gets=(), deletes=None):
+        self.calls = []
+        self._replies = {"POST": list(posts), "GET": list(gets)}
+        self._delete = deletes or _FakeResponse()
+
+    def _reply(self, method, url, kwargs):
+        self.calls.append((method, url, kwargs))
+        return self._replies[method].pop(0)
+
+    def post(self, url, **kwargs):
+        return self._reply("POST", url, kwargs)
+
+    def get(self, url, **kwargs):
+        return self._reply("GET", url, kwargs)
+
+    def delete(self, url, **kwargs):
+        self.calls.append(("DELETE", url, kwargs))
+        return self._delete
+
+
+def _upload_replies(state="ACTIVE", status=200):
+    """Replies to the start and upload/finalize requests of a resumable upload."""
+    return [
+        _FakeResponse(headers={"X-Goog-Upload-URL": "https://upload.example/session"}),
+        _FakeResponse(
+            status=status,
+            json_data={
+                "file": {
+                    "name": "files/abc",
+                    "uri": "https://generativelanguage.googleapis.com/v1beta/files/abc",
+                    "state": state,
+                }
+            },
+        ),
+    ]
+
+
+@pytest.fixture
+def large_video_google(coverage_hass, monkeypatch):
+    """Gemini provider for which a 30-byte video is too large to send inline."""
+    monkeypatch.setattr("custom_components.llmvision.providers.MAX_INLINE_VIDEO_BYTES", 8)
+    monkeypatch.setattr(
+        "custom_components.llmvision.providers.asyncio.sleep", AsyncMock()
+    )
+    google = Google(coverage_hass, "secret-key", "gemini-2.5-flash")
+    google._make_request = AsyncMock(return_value="ok")
+    return google
+
+
+def _sent_parts(google):
+    return google._make_request.await_args.args[0]["contents"][0]["parts"]
+
+
+@pytest.mark.anyio
+async def test_google_uploads_large_video_and_deletes_it(large_video_google):
+    google = large_video_google
+    active = {
+        "name": "files/abc",
+        "uri": "https://generativelanguage.googleapis.com/v1beta/files/abc",
+        "state": "ACTIVE",
+    }
+    google.session = _FakeFilesSession(
+        posts=_upload_replies(state="PROCESSING"), gets=[_FakeResponse(json_data=active)]
+    )
+
+    result = await google.vision_request(
+        make_coverage_call(videos=[_video(fps=2, data=b"x" * 30)])
+    )
+
+    assert result == "ok"
+    assert _sent_parts(google)[:2] == [
+        {"text": "Video 1:"},
+        {
+            "file_data": {"mime_type": "video/mp4", "file_uri": active["uri"]},
+            "video_metadata": {"fps": 2},
+        },
+    ]
+    methods = [(method, url) for method, url, _ in google.session.calls]
+    assert methods == [
+        ("POST", "https://generativelanguage.googleapis.com/upload/v1beta/files"),
+        ("POST", "https://upload.example/session"),
+        ("GET", "https://generativelanguage.googleapis.com/v1beta/files/abc"),
+        ("DELETE", "https://generativelanguage.googleapis.com/v1beta/files/abc"),
+    ]
+    start_headers = google.session.calls[0][2]["headers"]
+    assert start_headers["x-goog-api-key"] == "secret-key"
+    assert start_headers["X-Goog-Upload-Header-Content-Length"] == "30"
+    assert start_headers["X-Goog-Upload-Header-Content-Type"] == "video/mp4"
+    assert google.session.calls[1][2]["data"] == b"x" * 30
+
+
+@pytest.mark.anyio
+async def test_google_deletes_upload_when_request_fails(large_video_google):
+    google = large_video_google
+    google.session = _FakeFilesSession(posts=_upload_replies())
+    google._make_request = AsyncMock(side_effect=RuntimeError("quota"))
+
+    with pytest.raises(RuntimeError, match="quota"):
+        await google.vision_request(make_coverage_call(videos=[_video(data=b"x" * 30)]))
+
+    assert google.session.calls[-1][0] == "DELETE"
+
+
+@pytest.mark.anyio
+async def test_google_sends_images_when_upload_fails(large_video_google):
+    google = large_video_google
+    google.session = _FakeFilesSession(
+        posts=[_FakeResponse(status=403, json_data={"error": {"message": "denied"}})]
+    )
+
+    await google.vision_request(make_coverage_call(videos=[_video(data=b"x" * 30)]))
+
+    assert _inline_parts(google._make_request.await_args.args[0]) == [
+        {"mime_type": "image/jpeg", "data": "aW1n"}
+    ]
+    assert [method for method, _, _ in google.session.calls] == ["POST"]
+
+
+@pytest.mark.anyio
+async def test_google_sends_images_and_deletes_when_processing_fails(
+    large_video_google,
+):
+    google = large_video_google
+    google.session = _FakeFilesSession(posts=_upload_replies(state="FAILED"))
+
+    await google.vision_request(make_coverage_call(videos=[_video(data=b"x" * 30)]))
+
+    assert _inline_parts(google._make_request.await_args.args[0]) == [
+        {"mime_type": "image/jpeg", "data": "aW1n"}
+    ]
+    assert google.session.calls[-1][:2] == (
+        "DELETE",
+        "https://generativelanguage.googleapis.com/v1beta/files/abc",
+    )
+
+
+@pytest.mark.anyio
+async def test_google_sends_small_video_inline_without_uploading(large_video_google):
+    google = large_video_google
+    google.session = _FakeFilesSession()
+
+    await google.vision_request(make_coverage_call(videos=[_video(data=b"vid")]))
+
+    assert google.session.calls == []
+    assert _sent_parts(google)[1] == {
+        "inline_data": {"mime_type": "video/mp4", "data": "dmlk"}
+    }
+
+
+def test_google_oversized_video_without_upload_sends_images(large_video_google):
+    payload = large_video_google._prepare_vision_data(
+        make_coverage_call(videos=[_video(data=b"x" * 30)])
+    )
+
+    assert _inline_parts(payload) == [{"mime_type": "image/jpeg", "data": "aW1n"}]
 
 
 if __name__ == "__main__":
