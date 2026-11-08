@@ -616,6 +616,12 @@ class TestSetupServices:
             )
 
         assert update_sensor_mock.await_count == 4
+        # The extraction prompt is passed to providers as the call's system prompt
+        from custom_components.llmvision.const import DATA_EXTRACTION_PROMPT
+
+        assert call_obj.system_prompt == DATA_EXTRACTION_PROMPT.format(
+            data_format="text (string)"
+        )
 
     @pytest.mark.anyio
     async def test_data_analyzer_unsupported_and_unavailable_raise(self):

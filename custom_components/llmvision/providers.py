@@ -259,11 +259,8 @@ class Request:
                     pass
             # For non-structured output, use traditional title generation
             elif call.generate_title and call.response_format != "json":
-                call.message = (
-                    call.memory.title_prompt
-                    + "Create a title for this text: "
-                    + response_text
-                )
+                # The title prompt itself is sent as the system prompt by _prepare_text_data
+                call.message = "Create a title for this text: " + response_text
                 gen_title = await provider_instance.title_request(call)
         except Exception as e:
             _LOGGER.error(f"Provider {provider_name} failed to generate title: {e}")
@@ -483,8 +480,11 @@ class Provider(ABC):
             default_parameters["top_p"] = 0.95
         return default_parameters
 
-    def _get_system_prompt(self) -> str:
-        """Fetch system prompt from the Settings config entry stored in hass.data."""
+    def _get_system_prompt(self, call: Any = None) -> str:
+        """Return the call's own system prompt if set, else the one from the Settings entry."""
+        override = getattr(call, "system_prompt", None)
+        if isinstance(override, str) and override:
+            return override
         domain_data = self.hass.data.get(DOMAIN) or {}
         for _, data in domain_data.items():
             if data.get(CONF_PROVIDER) == "Settings":
@@ -753,7 +753,7 @@ class OpenAI(Provider):
         # User message
         payload["messages"][0]["content"].append({"type": "text", "text": call.message})
         # System prompt
-        system_prompt = self._get_system_prompt()
+        system_prompt = self._get_system_prompt(call)
         payload["messages"].insert(0, {"role": "system", "content": system_prompt})
 
         # Memory if use_memory is set
@@ -772,7 +772,7 @@ class OpenAI(Provider):
         payload = {
             "model": self.model,
             "messages": [
-                {"role": "user", "content": [{"type": "text", "text": title_prompt}]},
+                {"role": "system", "content": title_prompt},
                 {"role": "user", "content": [{"type": "text", "text": call.message}]},
             ],
             "max_completion_tokens": call.max_tokens,
@@ -908,7 +908,7 @@ class AzureOpenAI(Provider):
         # User message
         payload["messages"][0]["content"].append({"type": "text", "text": call.message})
         # System prompt
-        system_prompt = self._get_system_prompt()
+        system_prompt = self._get_system_prompt(call)
         payload["messages"].insert(0, {"role": "system", "content": system_prompt})
 
         # Memory if use_memory is set
@@ -952,7 +952,7 @@ class AzureOpenAI(Provider):
         title_prompt = self._get_title_prompt()
         payload = {
             "messages": [
-                {"role": "user", "content": [{"type": "text", "text": title_prompt}]},
+                {"role": "system", "content": title_prompt},
                 {"role": "user", "content": [{"type": "text", "text": call.message}]},
             ],
             "temperature": default_parameters.get("temperature"),
@@ -1203,7 +1203,7 @@ class Anthropic(Provider):
         # User message
         payload["messages"][0]["content"].append({"type": "text", "text": call.message})
         # System prompt
-        payload["system"] = self._get_system_prompt()
+        payload["system"] = self._get_system_prompt(call)
 
         # Memory images if use_memory is set
         if getattr(call, "use_memory", False):
@@ -1219,8 +1219,8 @@ class Anthropic(Provider):
         title_prompt = self._get_title_prompt()
         payload = {
             "model": self.model,
+            "system": title_prompt,
             "messages": [
-                {"role": "user", "content": [{"type": "text", "text": title_prompt}]},
                 {"role": "user", "content": [{"type": "text", "text": call.message}]},
             ],
             "max_tokens": call.max_tokens,
@@ -1366,10 +1366,9 @@ class Google(Provider):
         # User message
         payload["contents"][0]["parts"].append({"text": call.message})
         # System prompt
-        system_prompt = self._get_system_prompt()
-        payload["contents"].insert(
-            0, {"role": "user", "parts": [{"text": system_prompt}]}
-        )
+        payload["systemInstruction"] = {
+            "parts": [{"text": self._get_system_prompt(call)}]
+        }
         # Memory if use_memory is set
         if getattr(call, "use_memory", False):
             memory_content = call.memory._get_memory_images(memory_type="Google")
@@ -1382,8 +1381,8 @@ class Google(Provider):
         default_parameters = self._get_default_parameters(call)
         title_prompt = self._get_title_prompt()
         payload = {
+            "systemInstruction": {"parts": [{"text": title_prompt}]},
             "contents": [
-                {"role": "user", "parts": [{"text": title_prompt}]},
                 {"role": "user", "parts": [{"text": call.message}]},
             ],
             "generationConfig": {
@@ -1498,7 +1497,7 @@ class Groq(Provider):
         }
 
         payload["messages"].insert(
-            0, {"role": "system", "content": self._get_system_prompt()}
+            0, {"role": "system", "content": self._get_system_prompt(call)}
         )
         # Groq does not support multiple images, so no memory
 
@@ -1649,7 +1648,7 @@ class LocalAI(Provider):
         payload["messages"][0]["content"].append({"type": "text", "text": call.message})
         # System prompt
         payload["messages"].insert(
-            0, {"role": "system", "content": self._get_system_prompt()}
+            0, {"role": "system", "content": self._get_system_prompt(call)}
         )
 
         # Memory if use_memory is set
@@ -1690,7 +1689,7 @@ class LocalAI(Provider):
         payload = {
             "model": self.model,
             "messages": [
-                {"role": "user", "content": [{"type": "text", "text": title_prompt}]},
+                {"role": "system", "content": title_prompt},
                 {"role": "user", "content": [{"type": "text", "text": call.message}]},
             ],
             "max_tokens": call.max_tokens,
@@ -1785,7 +1784,6 @@ class Ollama(Provider):
         default_parameters = self._get_default_parameters(call)
         payload = {
             "model": self.model,
-            "system": self._get_system_prompt() if not call.model_is_glimpse() else "",
             "messages": [
                 {
                     "role": "user",
@@ -1797,8 +1795,6 @@ class Ollama(Provider):
                     "images": call.base64_images,
                 },
             ],
-            "prompt": (),
-            "images": call.base64_images,
             "stream": False,
             "keep_alive": default_parameters.get("keep_alive"),
             "think": default_parameters.get("think", False)
@@ -1810,6 +1806,12 @@ class Ollama(Provider):
                 "num_ctx": default_parameters.get("context_window"),
             },
         }
+
+        # System prompt (/api/chat only reads it from a system message)
+        if not call.model_is_glimpse():
+            payload["messages"].insert(
+                0, {"role": "system", "content": self._get_system_prompt(call)}
+            )
 
         # Add structured output support
         if call.response_format == "json" and call.structure:
@@ -1841,7 +1843,7 @@ class Ollama(Provider):
         payload = {
             "model": self.model,
             "messages": [
-                {"role": "user", "content": title_prompt},
+                {"role": "system", "content": title_prompt},
                 {"role": "user", "content": call.message},
             ],
             "stream": False,
@@ -2011,7 +2013,7 @@ class AWSBedrock(Provider):
             if "toolConfig" in data:
                 converse_kwargs["toolConfig"] = data.get("toolConfig")
 
-            # Add system prompt if present (for structured output)
+            # Add system prompt if present
             if "system" in data:
                 converse_kwargs["system"] = data.get("system")
 
@@ -2074,16 +2076,14 @@ class AWSBedrock(Provider):
         # User message
         payload["messages"][0]["content"].append({"text": call.message})
         # System prompt
-        payload["messages"].insert(
-            0, {"role": "user", "content": [{"text": self._get_system_prompt()}]}
-        )
+        payload["system"] = [{"text": self._get_system_prompt(call)}]
 
         # Memory images only when enabled
         if getattr(call, "use_memory", False):
             memory_content = call.memory._get_memory_images(memory_type="AWS")
             if memory_content:
                 payload["messages"].insert(
-                    1, {"role": "user", "content": memory_content}
+                    0, {"role": "user", "content": memory_content}
                 )
 
         # Add structured output support using tool definitions
@@ -2120,8 +2120,8 @@ class AWSBedrock(Provider):
     def _prepare_text_data(self, call: Any) -> dict:
         title_prompt = self._get_title_prompt()
         payload = {
+            "system": [{"text": title_prompt}],
             "messages": [
-                {"role": "user", "content": [{"text": title_prompt}]},
                 {"role": "user", "content": [{"text": call.message}]},
             ],
             "inferenceConfig": {

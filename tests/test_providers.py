@@ -2692,5 +2692,161 @@ def test_anthropic_unsupported_model_omits_disabled_thinking_parameter(coverage_
     assert "thinking" not in payload
 
 
+# ---------------- System prompt placement ----------------
+
+SYSTEM_PROMPT_PROVIDERS = [
+    "openai",
+    "azure",
+    "anthropic",
+    "google",
+    "groq",
+    "localai",
+    "ollama",
+    "bedrock",
+]
+
+
+def make_system_prompt_provider(name, hass):
+    local = {"ip_address": "127.0.0.1", "port": "8080", "https": False}
+    return {
+        "openai": lambda: OpenAI(hass, "k", "gpt-4o"),
+        "azure": lambda: AzureOpenAI(
+            hass,
+            "k",
+            "gpt-4",
+            endpoint={
+                "base_url": "https://{base_url}/{deployment}?api-version={api_version}",
+                "endpoint": "ep",
+                "deployment": "dep",
+                "api_version": "2025-01-01",
+            },
+        ),
+        "anthropic": lambda: Anthropic(hass, "k", "claude-sonnet-4-5"),
+        "google": lambda: Google(hass, "k", "gemini-2.5-flash"),
+        "groq": lambda: Groq(hass, "k", "llama"),
+        "localai": lambda: LocalAI(hass, "", "llava", endpoint=local),
+        "ollama": lambda: Ollama(hass, "", "gemma3", endpoint=local),
+        "bedrock": lambda: AWSBedrock(hass, "", "", "us-east-1", "m", api_key="t"),
+    }[name]()
+
+
+def _flatten_text(content):
+    if isinstance(content, str):
+        return content
+    return " ".join(part["text"] for part in content if "text" in part)
+
+
+def split_system_prompt(name, payload):
+    """Return (system prompt, [(role, text), ...]) from a provider payload."""
+    if name == "anthropic":
+        system, turns = payload.get("system"), payload["messages"]
+    elif name == "bedrock":
+        system = payload["system"][0]["text"] if "system" in payload else None
+        turns = payload["messages"]
+    elif name == "google":
+        instruction = payload.get("systemInstruction")
+        system = instruction["parts"][0]["text"] if instruction else None
+        return system, [
+            (c["role"], _flatten_text(c["parts"])) for c in payload["contents"]
+        ]
+    else:
+        messages = payload["messages"]
+        system = None
+        if messages and messages[0]["role"] == "system":
+            system, messages = messages[0]["content"], messages[1:]
+        turns = messages
+    return system, [(m["role"], _flatten_text(m["content"])) for m in turns]
+
+
+@pytest.mark.parametrize("name", SYSTEM_PROMPT_PROVIDERS)
+def test_vision_request_sends_system_prompt_as_system(name, coverage_hass):
+    provider = make_system_prompt_provider(name, coverage_hass)
+
+    payload = provider._prepare_vision_data(make_coverage_call())
+    system, turns = split_system_prompt(name, payload)
+
+    assert system == "system"  # Settings system prompt from coverage_hass
+    assert [role for role, _ in turns] == ["user"]
+    assert "system" not in turns[0][1]
+    assert turns[0][1].endswith("hello")
+
+
+@pytest.mark.parametrize("name", SYSTEM_PROMPT_PROVIDERS)
+def test_call_system_prompt_overrides_settings(name, coverage_hass):
+    provider = make_system_prompt_provider(name, coverage_hass)
+
+    payload = provider._prepare_vision_data(
+        make_coverage_call(system_prompt="extract data")
+    )
+
+    assert split_system_prompt(name, payload)[0] == "extract data"
+
+
+@pytest.mark.parametrize("name", SYSTEM_PROMPT_PROVIDERS)
+def test_title_request_sends_title_prompt_as_system(name, coverage_hass):
+    provider = make_system_prompt_provider(name, coverage_hass)
+    message = "Create a title for this text: A person at the door"
+
+    payload = provider._prepare_text_data(make_coverage_call(message=message))
+
+    assert split_system_prompt(name, payload) == ("title", [("user", message)])
+
+
+def test_ollama_vision_payload_has_no_generate_only_fields(coverage_hass):
+    provider = make_system_prompt_provider("ollama", coverage_hass)
+
+    payload = provider._prepare_vision_data(make_coverage_call())
+
+    for key in ("system", "prompt", "images"):
+        assert key not in payload
+    assert payload["messages"][1]["images"] == ["aW1n"]
+
+
+def test_ollama_glimpse_model_sends_no_system_prompt(coverage_hass):
+    provider = make_system_prompt_provider("ollama", coverage_hass)
+    call_obj = make_coverage_call()
+    call_obj.model_is_glimpse = lambda: True
+
+    payload = provider._prepare_vision_data(call_obj)
+
+    assert [m["role"] for m in payload["messages"]] == ["user"]
+
+
+def test_bedrock_memory_comes_before_question(coverage_hass):
+    provider = make_system_prompt_provider("bedrock", coverage_hass)
+
+    payload = provider._prepare_vision_data(make_coverage_call(use_memory=True))
+    _, turns = split_system_prompt("bedrock", payload)
+
+    assert [text for _, text in turns] == ["mem-AWS", "cam.jpg: hello"]
+
+
+@pytest.mark.anyio
+async def test_request_call_title_message_does_not_repeat_title_prompt(
+    monkeypatch, coverage_hass
+):
+    seen = {}
+
+    class CapturingProvider(DummyProvider):
+        async def title_request(self, call_obj):
+            seen["message"] = call_obj.message
+            return "Title"
+
+    monkeypatch.setattr(
+        ProviderFactory,
+        "create",
+        lambda **kwargs: CapturingProvider(
+            response_text="A person at the door", supports=False
+        ),
+    )
+    req = Request(coverage_hass, "m", 10, 0.2)
+    req.base64_images = ["aW1n"]
+    req.filenames = ["f.jpg"]
+
+    await req.call(make_coverage_call(generate_title=True))
+
+    assert seen["message"] == "Create a title for this text: A person at the door"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

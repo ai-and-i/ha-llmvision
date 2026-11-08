@@ -484,6 +484,8 @@ class ServiceCallData:
         self.title_field: str = data_call.data.get(TITLE_FIELD, "")
         self.description_field: str = data_call.data.get(DESCRIPTION_FIELD, "")
         self.memory: Memory | None = None
+        # Overrides the Settings system prompt for this call when set
+        self.system_prompt: str | None = None
 
         # ------------ Create Event ------------
         self.title: str = data_call.data.get("title")
@@ -856,7 +858,8 @@ def setup(hass, config):
             expose_images=call.expose_images,
         )
 
-        call.memory = Memory(hass, system_prompt=DATA_EXTRACTION_PROMPT)
+        call.system_prompt = DATA_EXTRACTION_PROMPT.format(data_format=data_type)
+        call.memory = Memory(hass)
         await call.memory._update_memory()
 
         response = await request.call(call)
