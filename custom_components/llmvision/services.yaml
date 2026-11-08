@@ -644,10 +644,66 @@ create_event:
       selector:
         text:
           multiline: true
+    category:
+      name: Category
+      required: false
+      description: >-
+        Category of the event's main subject. Stored as given. If left blank,
+        it is taken from the first label that has a category, or else detected
+        from the title and description.
+      example: 'animal'
+      selector:
+        select:
+          options:
+            - label: Person
+              value: person
+            - label: Vehicle
+              value: vehicle
+            - label: Animal
+              value: animal
+            - label: Delivery
+              value: delivery
+            - label: Entity
+              value: entity
+            - label: Nature
+              value: nature
+    labels:
+      name: Labels
+      required: false
+      description: >-
+        Free-text tags for the notable subjects and objects, most important
+        first. The first one is the event's label. If neither labels nor label
+        is set, the label is detected from the title and description.
+      example: '["squirrel", "bird feeder"]'
+      selector:
+        select:
+          multiple: true
+          custom_value: true
+          options:
+            - Alarm
+            - Bicycle
+            - Bird
+            - Bus
+            - Camera
+            - Car
+            - Cat
+            - Dog
+            - Door
+            - Key
+            - Light
+            - Lock
+            - Motorcycle
+            - Package
+            - Person
+            - Plant
+            - Sensor
+            - Tree
+            - Truck
+            - Van
     label:
       name: Label
       required: false
-      description: 'Label to assign the event to'
+      description: 'Single label for the event. Same as Labels with one item; put before Labels when both are set.'
       example: 'Car'
       selector:
         select:
@@ -760,11 +816,12 @@ get_events:
     labels:
       name: Labels
       required: false
-      description: 'Only return events matching one of the selected labels'
+      description: 'Only return events that have any of these labels'
       example: 'person,car,dog'
       selector:
         select:
           multiple: True
+          custom_value: true
           options:
             - Alarm
             - Bicycle

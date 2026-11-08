@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
+from homeassistant.exceptions import ServiceValidationError
 
 from custom_components.llmvision.api import (
     TimelineEventCreateView,
@@ -77,6 +78,7 @@ class TestTimelineEventsView:
                 "limit": "500",
                 "cameras": " Front Door , Backyard ",
                 "categories": "person, vehicle",
+                "labels": "Ladder, bird feeder",
                 "days": "7",
                 "hours": "2",
                 "include_no_activity": "YeS",
@@ -100,6 +102,7 @@ class TestTimelineEventsView:
             limit=500,
             cameras=["Front Door", "Backyard"],
             categories=["person", "vehicle"],
+            labels=["Ladder", "bird feeder"],
             start=(now - timedelta(hours=2)).isoformat(),
             end=now.isoformat(),
             include_no_activity=True,
@@ -131,6 +134,7 @@ class TestTimelineEventsView:
             limit=10,
             cameras=None,
             categories=None,
+            labels=None,
             start=None,
             end=None,
             include_no_activity=False,
@@ -163,7 +167,8 @@ class TestTimelineEventCreateView:
         assert _response_payload(response)["message"] == "Invalid JSON body"
 
     @pytest.mark.asyncio
-    async def test_creates_event_with_defaults_and_lowercase_label(self, mock_hass, mock_config_entry):
+    async def test_creates_event_with_defaults_and_label(self, mock_hass, mock_config_entry):
+        """The label is passed as sent: Timeline.create_event normalizes labels."""
         request = _make_request(
             mock_hass,
             json_body={
@@ -195,8 +200,48 @@ class TestTimelineEventCreateView:
             description="Someone at the door",
             key_frame="snapshot.jpg",
             camera_name="camera.front_door",
-            label="person",
+            label="Person",
+            category=None,
+            labels=None,
         )
+
+    @pytest.mark.asyncio
+    async def test_creates_event_with_category_and_labels(self, mock_hass, mock_config_entry):
+        request = _make_request(
+            mock_hass,
+            json_body={"category": "animal", "labels": ["squirrel", "bird feeder"]},
+        )
+        timeline = Mock()
+        timeline.create_event = AsyncMock()
+
+        with patch(
+            "custom_components.llmvision.api.async_get_settings_entry",
+            new=AsyncMock(return_value=mock_config_entry),
+        ), patch("custom_components.llmvision.api.Timeline", return_value=timeline):
+            response = await TimelineEventCreateView().post(request)
+
+        assert response.status == 200
+        call = timeline.create_event.await_args.kwargs
+        assert call["category"] == "animal"
+        assert call["labels"] == ["squirrel", "bird feeder"]
+        assert call["label"] == ""
+
+    @pytest.mark.asyncio
+    async def test_create_returns_400_for_unknown_category(self, mock_hass, mock_config_entry):
+        request = _make_request(mock_hass, json_body={"category": "robot"})
+        timeline = Mock()
+        timeline.create_event = AsyncMock(
+            side_effect=ServiceValidationError("category must be one of person, got 'robot'")
+        )
+
+        with patch(
+            "custom_components.llmvision.api.async_get_settings_entry",
+            new=AsyncMock(return_value=mock_config_entry),
+        ), patch("custom_components.llmvision.api.Timeline", return_value=timeline):
+            response = await TimelineEventCreateView().post(request)
+
+        assert response.status == 400
+        assert "robot" in _response_payload(response)["message"]
 
     @pytest.mark.asyncio
     async def test_creates_event_from_explicit_times(self, mock_hass, mock_config_entry):
@@ -408,9 +453,59 @@ class TestTimelineEventView:
         assert call["title"] == "Original"
         assert call["description"] == "Updated description"
         assert call["camera_name"] == "camera.backyard"
-        assert call["label"] == "vehicle"
+        assert call["label"] == "Vehicle"
+        # Not sent: update_event keeps the event's category and labels
+        assert call["category"] is None
+        assert call["labels"] is None
         assert call["start"].isoformat() == existing["start"]
         assert call["end"].isoformat() == existing["end"]
+
+    @pytest.mark.asyncio
+    async def test_post_passes_category_and_labels(self, mock_hass, mock_config_entry):
+        request = _make_request(
+            mock_hass, json_body={"category": "person", "labels": ["gardener", "ladder"]}
+        )
+        existing = {
+            "title": "Original",
+            "start": "2024-01-15T12:00:00+00:00",
+            "end": "2024-01-15T12:05:00+00:00",
+        }
+        timeline = Mock()
+        timeline.get_event = AsyncMock(side_effect=[existing, existing])
+        timeline.update_event = AsyncMock()
+
+        with patch(
+            "custom_components.llmvision.api.async_get_settings_entry",
+            new=AsyncMock(return_value=mock_config_entry),
+        ), patch("custom_components.llmvision.api.Timeline", return_value=timeline):
+            response = await TimelineEventView().post(request, "event-1")
+
+        assert response.status == 200
+        call = timeline.update_event.await_args.kwargs
+        assert call["category"] == "person"
+        assert call["labels"] == ["gardener", "ladder"]
+        assert call["label"] is None
+
+    @pytest.mark.asyncio
+    async def test_post_returns_400_for_unknown_category(self, mock_hass, mock_config_entry):
+        request = _make_request(mock_hass, json_body={"category": "robot"})
+        existing = {
+            "title": "Original",
+            "start": "2024-01-15T12:00:00+00:00",
+            "end": "2024-01-15T12:05:00+00:00",
+        }
+        timeline = Mock()
+        timeline.get_event = AsyncMock(return_value=existing)
+        timeline.update_event = AsyncMock(side_effect=ServiceValidationError("got 'robot'"))
+
+        with patch(
+            "custom_components.llmvision.api.async_get_settings_entry",
+            new=AsyncMock(return_value=mock_config_entry),
+        ), patch("custom_components.llmvision.api.Timeline", return_value=timeline):
+            response = await TimelineEventView().post(request, "event-1")
+
+        assert response.status == 400
+        assert "robot" in _response_payload(response)["message"]
 
     @pytest.mark.asyncio
     async def test_post_returns_404_without_settings_entry(self, mock_hass):

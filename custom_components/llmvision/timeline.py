@@ -21,7 +21,7 @@ import logging
 
 _LOGGER = logging.getLogger(__name__)
 
-DB_VERSION = 5
+DB_VERSION = 6
 
 # Unlinked files younger than this are kept by _cleanup. Snapshots only need
 # to survive the event insert. A clip from video_analyzer may be attached by a
@@ -72,14 +72,54 @@ def validate_clip_path(clip_path: str | None, clips_dir: str = CLIPS_DIR) -> str
     return os.path.normpath(clip_path)
 
 
-async def _get_category_and_label(
-    hass: HomeAssistant, config_entry: ConfigEntry, query: str
-) -> tuple[str, str]:
-    """Return (category, label) for the best match in the query using the language regex template.
-    - category: top-level category key (e.g., 'people', 'vehicles', ...)
-    - label: canonical label mapped from the matched synonym (e.g., 'person', 'car', ...)
-    Returns ("", "") when no match is found.
+# Priority when a text matches several categories (lower is higher). Its keys
+# are also the categories if the timeline strings fail to load.
+_CATEGORY_PRIORITY = {
+    "delivery": 0,
+    "vehicle": 1,
+    "person": 2,
+    "animal": 3,
+    "entity": 4,
+    "nature": 5,
+}
+
+
+def normalize_labels(labels) -> list[str]:
+    """Labels stripped and lowercased, without empties or duplicates, in order.
+
+    Takes a list or a comma-separated string. Labels are free text: they are
+    not checked against the known labels.
     """
+    if labels is None:
+        return []
+    if isinstance(labels, str):
+        labels = labels.split(",")
+    elif not isinstance(labels, (list, tuple)):
+        labels = [labels]
+    result: list[str] = []
+    for item in labels:
+        text = "" if item is None else str(item).strip().lower()
+        if text and text not in result:
+            result.append(text)
+    return result
+
+
+def _parse_labels(raw: str | None, label: str | None) -> list[str]:
+    """The labels column (a JSON array), or [label] for a row without one."""
+    if raw:
+        try:
+            value = json.loads(raw)
+        except (TypeError, ValueError):
+            value = None
+        if isinstance(value, list):
+            return [str(item) for item in value if item not in (None, "")]
+    return [label] if label else []
+
+
+async def _load_timeline_strings(
+    hass: HomeAssistant, config_entry: ConfigEntry
+) -> dict:
+    """timeline_strings/<lang>.json for the timeline language ({} on error)."""
 
     def load_lang_json(path: str) -> dict:
         with open(path, "r", encoding="utf-8") as f:
@@ -121,11 +161,32 @@ async def _get_category_and_label(
         )
 
     try:
-        lang_data = await hass.async_add_executor_job(load_lang_json, lang_file_path)
+        return await hass.async_add_executor_job(load_lang_json, lang_file_path)
     except Exception as e:
         _LOGGER.error(f"Error loading language file {lang_file_path}: {e}")
-        return ("", "")
+        return {}
 
+
+def _get_categories(lang_data: dict) -> list[str]:
+    """The category keys of the timeline strings, lowercased."""
+    categories = [str(key).lower() for key in (lang_data.get("categories") or {})]
+    return categories or list(_CATEGORY_PRIORITY)
+
+
+async def _get_category_and_label(
+    hass: HomeAssistant, config_entry: ConfigEntry, query: str
+) -> tuple[str, str]:
+    """Return (category, label) for the best match in the query using the language regex template.
+    - category: top-level category key (e.g., 'person', 'vehicle', ...)
+    - label: canonical label mapped from the matched synonym (e.g., 'person', 'car', ...)
+    Returns ("", "") when no match is found.
+    """
+    lang_data = await _load_timeline_strings(hass, config_entry)
+    return _match_category_and_label(lang_data, query)
+
+
+def _match_category_and_label(lang_data: dict, query: str | None) -> tuple[str, str]:
+    """_get_category_and_label on already loaded timeline strings."""
     categories_data = lang_data.get("categories", {})
     regex_template = lang_data.get("regex")
 
@@ -182,16 +243,6 @@ async def _get_category_and_label(
             return None
 
     # Collect all matches so we can pick the best according to category priority
-    # Priority order (lower is higher priority)
-    category_priority = {
-        "delivery": 0,
-        "vehicle": 1,
-        "person": 2,
-        "animal": 3,
-        "entity": 4,
-        "nature": 5,
-    }
-
     matches: list[tuple[int, int, int, str, str]] = (
         []
     )  # (priority, -key_len, order_index, category, label)
@@ -206,7 +257,7 @@ async def _get_category_and_label(
             pat = compile_pattern(str(key))
             if pat and pat.search(q):
                 canonical_label = str(canonical) if canonical else str(key)
-                prio = category_priority.get(str(cat_name).lower(), 99)
+                prio = _CATEGORY_PRIORITY.get(str(cat_name).lower(), 99)
                 matches.append(
                     (prio, -len(str(key)), key_index, str(cat_name), canonical_label)
                 )
@@ -234,6 +285,7 @@ class Event:
         category: str,
         label: str,
         clip: str | None = None,
+        labels: list[str] | None = None,
     ):
         self.uid = uid
         self.title = title
@@ -243,12 +295,15 @@ class Event:
         self.key_frame = key_frame
         self.camera_name = camera_name
         self.category = category
+        # The primary label, labels[0]
         self.label = label
+        # Free-text tags, most important first
+        self.labels = list(labels) if labels is not None else ([label] if label else [])
         # Path of the saved source video, or None
         self.clip = clip or None
 
     def __repr__(self):
-        return f"Event(uid={self.uid}, title={self.title}, start={self.start}, end={self.end}, description={self.description}, key_frame={self.key_frame}, camera_name={self.camera_name}, category={self.category}, label={self.label}, clip={self.clip})"
+        return f"Event(uid={self.uid}, title={self.title}, start={self.start}, end={self.end}, description={self.description}, key_frame={self.key_frame}, camera_name={self.camera_name}, category={self.category}, label={self.label}, labels={self.labels}, clip={self.clip})"
 
     def __str__(self):
         return self.__repr__()
@@ -324,6 +379,7 @@ class Timeline:
             "category",
             "label",
             "clip",
+            "labels",
         }
         try:
             async with aiosqlite.connect(self._db_path) as db:
@@ -349,7 +405,8 @@ class Timeline:
                         camera_name TEXT,
                         category TEXT,
                         label TEXT,
-                        clip TEXT
+                        clip TEXT,
+                        labels TEXT
                     )
                 """)
                 await db.execute("""
@@ -373,7 +430,7 @@ class Timeline:
             _LOGGER.debug(f"Post-init version set skipped: {e}")
 
     async def _migrate(self):
-        """Handles migration for events.db (current v5)"""
+        """Handles migration for events.db (current v6)"""
         try:
             lock = _MIGRATION_LOCKS.setdefault(self._db_path, asyncio.Lock())
             async with lock:
@@ -386,7 +443,9 @@ class Timeline:
                 )
                 if current_version < 4:
                     await self._migrate_to_v4()
-                await self._migrate_to_v5()
+                if current_version < 5:
+                    await self._migrate_to_v5()
+                await self._migrate_to_v6()
 
                 # Mark migration complete by setting user_version
                 await self._set_db_version(DB_VERSION)
@@ -597,6 +656,27 @@ class Timeline:
         except aiosqlite.Error as e:
             _LOGGER.error(f"Error migrating events.db to v5: {e}")
 
+    async def _migrate_to_v6(self):
+        """v5 -> v6: add the labels column (JSON array), filled with [label]."""
+        try:
+            async with aiosqlite.connect(self._db_path) as db:
+                async with db.execute("PRAGMA table_info(events)") as cursor:
+                    column_names = [column[1] for column in await cursor.fetchall()]
+                if "labels" not in column_names:
+                    _LOGGER.info("Adding labels column to events.db")
+                    await db.execute("ALTER TABLE events ADD COLUMN labels TEXT")
+                async with db.execute(
+                    "SELECT uid, label FROM events WHERE labels IS NULL"
+                ) as cursor:
+                    rows = await cursor.fetchall()
+                await db.executemany(
+                    "UPDATE events SET labels = ? WHERE uid = ?",
+                    [(json.dumps([label] if label else []), uid) for uid, label in rows],
+                )
+                await db.commit()
+        except aiosqlite.Error as e:
+            _LOGGER.error(f"Error migrating events.db to v6: {e}")
+
     def _ensure_datetime(self, dt):
         """Ensures the input is a datetime.datetime object"""
         if isinstance(dt, datetime.date) and not isinstance(dt, datetime.datetime):
@@ -668,9 +748,37 @@ class Timeline:
         except aiosqlite.Error as e:
             _LOGGER.error(f"Error purging expired timeline events: {e}")
 
-    async def _get_category_from_label(self, label: str) -> str:
-        """Returns the category for a given label using the language regex template."""
-        return (await _get_category_and_label(self.hass, self._config_entry, label))[0]
+    async def _resolve_category_and_labels(
+        self, category: str | None, labels: list[str], query: str
+    ) -> tuple[str, list[str]]:
+        """(category, labels) to store, from what the caller gave.
+
+        labels must be normalized (normalize_labels). A given category is kept
+        as-is. Without one, it is the category of the first label that maps to
+        one, or "". With neither, both come from keyword detection on query.
+        Raises ServiceValidationError for a category not in the timeline strings.
+        """
+        lang_data = await _load_timeline_strings(self.hass, self._config_entry)
+        raw_category = "" if category is None else str(category).strip()
+        if raw_category:
+            categories = _get_categories(lang_data)
+            if raw_category.lower() not in categories:
+                raise ServiceValidationError(
+                    f"category must be one of {', '.join(categories)}, got '{raw_category}'"
+                )
+            return raw_category.lower(), labels
+        if labels:
+            for label in labels:
+                derived, _ = _match_category_and_label(lang_data, label)
+                if derived:
+                    return derived, labels
+            return "", labels
+        try:
+            auto_category, auto_label = _match_category_and_label(lang_data, query)
+        except Exception as e:
+            _LOGGER.warning(f"Failed to resolve category: {e}")
+            return "", []
+        return auto_category, [auto_label] if auto_label else []
 
     async def get_linked_images(self):
         """Returns the filenames of key_frames associated with events"""
@@ -690,12 +798,12 @@ class Timeline:
                 async with db.execute("""
                     SELECT
                         uid, title, start, end, description,
-                        category, key_frame, camera_name, label, clip
+                        category, key_frame, camera_name, label, clip, labels
                     FROM events
                     """) as cursor:
                     rows = await cursor.fetchall()
                     for row in rows:
-                        # row: uid, summary, start, end, description, category, key_frame, camera_name, label, clip
+                        # row: uid, summary, start, end, description, category, key_frame, camera_name, label, clip, labels
                         try:
                             row_start = (
                                 dt_util.parse_datetime(row[2]) if row[2] else None
@@ -721,6 +829,7 @@ class Timeline:
                             camera_name=row[7],
                             label=row[8],
                             clip=row[9],
+                            labels=_parse_labels(row[10], row[8]),
                         )
                         self.events.append(event)
         except aiosqlite.Error as e:
@@ -746,6 +855,7 @@ class Timeline:
                     "camera_name": event.camera_name,
                     "category": event.category,
                     "label": event.label,
+                    "labels": event.labels,
                     "clip": event.clip,
                 }
                 return event_dict
@@ -762,7 +872,8 @@ class Timeline:
         include_no_activity=False,
     ) -> list[dict]:
         """Returns json event data from the database. Used by the API.
-        Supports filtering by camera, category, time range, and sorting by start (newest first).
+        Supports filtering by camera, category, label, time range, and sorting by start (newest first).
+        An event passes the labels filter when any of its labels is in labels.
         Set include_no_activity=True to include events whose title is 'no activity observed'.
         """
         _LOGGER.debug(
@@ -786,17 +897,20 @@ class Timeline:
 
         start_dt = normalize_input_dt(start)
         end_dt = normalize_input_dt(end)
+        camera_filter = [c.lower() for c in cameras or []]
+        category_filter = [c.lower() for c in categories or []]
+        label_filter = {l.lower() for l in labels or []}
 
         async with aiosqlite.connect(self._db_path) as db:
             async with db.execute("""
                 SELECT
                     uid, title, start, end, description,
-                    category, key_frame, camera_name, label, clip
+                    category, key_frame, camera_name, label, clip, labels
                 FROM events
                 """) as cursor:
                 rows = await cursor.fetchall()
                 for row in rows:
-                    # row: uid, title, start, end, description, category, key_frame, camera_name, label, clip
+                    # row: uid, title, start, end, description, category, key_frame, camera_name, label, clip, labels
                     try:
                         row_start = dt_util.parse_datetime(row[2]) if row[2] else None
                         row_end = dt_util.parse_datetime(row[3]) if row[3] else None
@@ -815,21 +929,21 @@ class Timeline:
                             continue
 
                     # Camera filter — events with no camera pass through unconditionally
-                    if cameras and (row[7] or "").strip():
+                    if camera_filter and (row[7] or "").strip():
                         camera_name = (row[7] or "").lower()
-                        if camera_name not in [c.lower() for c in cameras]:
+                        if camera_name not in camera_filter:
                             continue
 
                     # Category filter
-                    if categories:
+                    if category_filter:
                         category_name = (row[5] or "").lower()
-                        if category_name not in [c.lower() for c in categories]:
+                        if category_name not in category_filter:
                             continue
 
-                    # Label filter
-                    if labels:
-                        label_name = (row[8] or "").lower()
-                        if label_name not in [l.lower() for l in labels]:
+                    # Label filter: any of the event's labels
+                    row_labels = _parse_labels(row[10], row[8])
+                    if label_filter:
+                        if not any(l.lower() in label_filter for l in row_labels):
                             continue
 
                     # Range overlap filter
@@ -849,6 +963,7 @@ class Timeline:
                             "camera_name": row[7],
                             "category": row[5],
                             "label": row[8],
+                            "labels": row_labels,
                             "clip": row[9] or None,
                         }
                     )
@@ -878,13 +993,26 @@ class Timeline:
         camera_name: str,
         label: str = "",
         clip: str | None = None,
+        category: str | None = None,
+        labels: list[str] | str | None = None,
     ) -> None:
         """Adds a new event to calendar.
 
         clip is the path of a saved source video. Callers validate it (see
         validate_clip_path); delete_event only removes files in the clips dir.
+
+        category is one of the timeline categories, stored as given.
+        labels are free-text tags, most important first; label is a single
+        label put before them. The first label is stored as the event's label.
+        See _resolve_category_and_labels for what is used when they are empty.
+        Raises ServiceValidationError for an unknown category.
         """
-        category = ""
+        # Validate before marking files pending and taking the cleanup lock
+        category, labels = await self._resolve_category_and_labels(
+            category,
+            normalize_labels([label, *normalize_labels(labels)]),
+            " ".join(part for part in (title or "", description or "") if part),
+        )
 
         # Ensure dtstart and dtend are datetime objects
         if isinstance(start, str):
@@ -906,25 +1034,6 @@ class Timeline:
                 # No pre-load needed: the in-memory list is not read before the
                 # insert below, and _insert_event() reloads it afterwards. Skipping
                 # this redundant full-DB reload keeps event creation off the hot path.
-
-                # Resolve category and label if not provided
-                if not label:
-                    try:
-                        query_text = " ".join(
-                            part for part in (title or "", description or "") if part
-                        )
-                        auto_category, auto_label = await _get_category_and_label(
-                            self.hass, self._config_entry, query_text
-                        )
-                        if not category:
-                            category = auto_category
-                        if not label:
-                            label = auto_label
-                    except Exception as e:
-                        _LOGGER.warning(f"Failed to resolve category: {e}")
-                else:
-                    category = await self._get_category_from_label(label)
-
                 event = Event(
                     uid=str(uuid.uuid4()),
                     title=title,
@@ -934,7 +1043,8 @@ class Timeline:
                     key_frame=key_frame,
                     camera_name=camera_name,
                     category=category,
-                    label=label,
+                    label=labels[0] if labels else "",
+                    labels=labels,
                     clip=clip,
                 )
                 _LOGGER.info(f"Creating event: {event}")
@@ -950,8 +1060,8 @@ class Timeline:
                 _LOGGER.info(f"Inserting event into database: {event}")
                 await db.execute(
                     """
-                    INSERT INTO events (uid, title, start, end, description, key_frame, camera_name, category, label, clip)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO events (uid, title, start, end, description, key_frame, camera_name, category, label, clip, labels)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                     (
                         event.uid,
@@ -966,6 +1076,7 @@ class Timeline:
                         event.category,
                         event.label,
                         event.clip,
+                        json.dumps(event.labels),
                     ),
                 )
                 await db.commit()
@@ -982,10 +1093,33 @@ class Timeline:
         description: str,
         key_frame: str,
         camera_name: str,
-        label: str,
+        label: str | None = None,
+        category: str | None = None,
+        labels: list[str] | str | None = None,
     ) -> None:
-        """Updates an existing event in the calendar."""
+        """Updates an existing event in the calendar.
+
+        category, labels and label follow the create_event rules, except that
+        None keeps them: with none of them given, the event keeps its category
+        and labels; with only category, it keeps its labels.
+        Raises ServiceValidationError for an unknown category.
+        """
         await self.load_events()
+        existing = next((e for e in self.events if e.uid == uid), None)
+        existing_labels = existing.labels if existing else []
+        if category is None and labels is None and label is None:
+            category = existing.category if existing else ""
+            labels = existing_labels
+        else:
+            if labels is None and label is None:
+                labels = existing_labels
+            else:
+                labels = normalize_labels([label, *normalize_labels(labels)])
+            category, labels = await self._resolve_category_and_labels(
+                category,
+                labels,
+                " ".join(part for part in (title or "", description or "") if part),
+            )
 
         # Ensure dtstart and dtend are datetime objects
         if isinstance(start, str):
@@ -1002,7 +1136,7 @@ class Timeline:
                 await db.execute(
                     """
                     UPDATE events
-                    SET title = ?, start = ?, end = ?, description = ?, key_frame = ?, camera_name = ?, category = ?, label = ?
+                    SET title = ?, start = ?, end = ?, description = ?, key_frame = ?, camera_name = ?, category = ?, label = ?, labels = ?
                     WHERE uid = ?
                 """,
                     (
@@ -1012,8 +1146,9 @@ class Timeline:
                         description,
                         key_frame,
                         camera_name,
-                        await self._get_category_from_label(label),
-                        label,
+                        category,
+                        labels[0] if labels else "",
+                        json.dumps(labels),
                         uid,
                     ),
                 )

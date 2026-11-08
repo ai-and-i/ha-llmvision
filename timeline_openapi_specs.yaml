@@ -29,7 +29,7 @@ components:
   schemas:
     Event:
       type: object
-      required: [uid, title, start, end, key_frame, camera_name, category, label]
+      required: [uid, title, start, end, key_frame, camera_name, category, label, labels]
       properties:
         uid:
           type: string
@@ -62,10 +62,18 @@ components:
           example: camera.front_door
         category:
           type: string
-          example: person
+          description: One of person, vehicle, animal, delivery, entity, nature, or "" when unknown.
+          example: animal
         label:
           type: string
-          example: person
+          description: The primary label, labels[0], or "".
+          example: squirrel
+        labels:
+          type: array
+          items:
+            type: string
+          description: Free-text lowercase tags, most important first.
+          example: [squirrel, bird feeder]
 
     EventListResponse:
       type: object
@@ -107,9 +115,22 @@ components:
         camera_entity:
           type: string
           description: Alias for camera_name.
+        category:
+          type: string
+          enum: [person, vehicle, animal, delivery, entity, nature]
+          description: |
+            Stored as given (case-insensitive). Without it, the category of the
+            first label that has one, or "". With neither category nor labels,
+            both are detected from the title and description.
+        labels:
+          type: array
+          items:
+            type: string
+          description: Free-text tags, most important first. Stripped, lowercased and deduplicated.
+          example: [squirrel, bird feeder]
         label:
           type: string
-          description: Lowercased by the API before persistence.
+          description: Single label, put before labels. Lowercased before persistence.
           default: ""
         start:
           oneOf:
@@ -141,9 +162,21 @@ components:
         camera_entity:
           type: string
           description: Alias for camera_name.
+        category:
+          type: string
+          enum: [person, vehicle, animal, delivery, entity, nature]
+          description: |
+            As on create. When category, labels and label are all omitted, the
+            event keeps its category and labels. When only category is sent, it
+            keeps its labels.
+        labels:
+          type: array
+          items:
+            type: string
+          description: Replaces the event's labels. As on create.
         label:
           type: string
-          description: Lowercased by the API before persistence.
+          description: Single label, put before labels. Lowercased before persistence.
         start:
           oneOf:
             - type: string
@@ -221,6 +254,19 @@ paths:
           style: form
           explode: false
           description: Comma-separated list of categories.
+        - name: labels
+          in: query
+          required: false
+          schema:
+            type: array
+            items:
+              type: string
+            example:
+              - squirrel
+              - ladder
+          style: form
+          explode: false
+          description: Comma-separated list of labels. An event matches when any of its labels is listed (case-insensitive).
         - name: start
           in: query
           required: false
@@ -327,7 +373,7 @@ paths:
                   - $ref: '#/components/schemas/EventResponse'
                   - $ref: '#/components/schemas/UpdateResponse'
         '400':
-          description: Invalid JSON body or invalid start/end time
+          description: Invalid JSON body, invalid start/end time or unknown category
         '404':
           description: Event not found or settings config entry not found
         '500':
@@ -377,7 +423,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/StatusResponse'
         '400':
-          description: Invalid JSON body
+          description: Invalid JSON body or unknown category
         '404':
           description: Settings config entry not found
         '500':

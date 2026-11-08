@@ -852,6 +852,37 @@ class TestSetupServices:
         assert result == {"events": [{"id": 1}]}
 
     @pytest.mark.anyio
+    async def test_create_event_passes_category_and_labels(self):
+        hass = _make_hass()
+        assert setup(hass, {}) is True
+        handlers = self._registered_handlers(hass)
+        settings = Mock()
+        settings.data = {"provider": "Settings"}
+        hass.config_entries.async_entries.return_value = [settings]
+        timeline = Mock()
+        timeline.create_event = AsyncMock()
+        timeline.get_events_json = AsyncMock(return_value=[])
+
+        with patch("custom_components.llmvision.Timeline", return_value=timeline):
+            await handlers["create_event"](
+                _build_data_call(
+                    _base_service_data(
+                        category="animal", labels=["squirrel", "bird feeder"], label=""
+                    )
+                )
+            )
+            await handlers["get_events"](_build_data_call({"labels": "Ladder, bird feeder"}))
+
+        kwargs = timeline.create_event.await_args.kwargs
+        assert kwargs["category"] == "animal"
+        assert kwargs["labels"] == ["squirrel", "bird feeder"]
+        assert kwargs["label"] == ""
+        assert timeline.get_events_json.await_args.kwargs["labels"] == [
+            "ladder",
+            "bird feeder",
+        ]
+
+    @pytest.mark.anyio
     async def test_create_event_and_get_events_missing_settings_raise(self):
         hass = _make_hass()
         assert setup(hass, {}) is True

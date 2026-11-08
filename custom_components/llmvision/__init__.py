@@ -1,5 +1,5 @@
 from datetime import datetime
-from .timeline import Timeline, validate_clip_path
+from .timeline import Timeline, normalize_labels, validate_clip_path
 from .providers import ProviderFactory, Request
 from .memory import Memory
 from .media_handlers import MediaProcessor
@@ -522,6 +522,9 @@ class ServiceCallData:
         self.clip_path: str = str(data_call.data.get(CLIP_PATH) or "")
         self.camera_entity: str = data_call.data.get("camera_entity", "")
         self.label: str = data_call.data.get("label", "")
+        # Validated by Timeline.create_event. Its labels are self.labels, which
+        # is read under Get Events (the same field name).
+        self.category: str = data_call.data.get("category", "")
 
         # ------------- Get Events --------------
         self.start: datetime = data_call.data.get(
@@ -962,8 +965,10 @@ def setup(hass, config):
             description=call.description,
             key_frame=call.image_path,
             camera_name=call.camera_entity,
-            label=call.label.lower(),
+            label=call.label,
             clip=clip or None,
+            category=call.category,
+            labels=call.labels,
         )
         async_dispatcher_send(hass, SIGNAL_TIMELINE_UPDATED)
 
@@ -988,7 +993,7 @@ def setup(hass, config):
             end=data_call.data.get("end"),
             cameras=[camera.lower() for camera in data_call.data.get("cameras", [])],
             categories=[category.lower() for category in data_call.data.get("categories", [])],
-            labels=[label.lower() for label in data_call.data.get("labels", [])],
+            labels=normalize_labels(data_call.data.get("labels")),
             limit=data_call.data.get("limit"),
             include_no_activity=data_call.data.get("include_no_activity", True),
         )

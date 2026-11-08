@@ -25,6 +25,7 @@ from custom_components.llmvision.timeline import (
     Event,
     Timeline,
     _get_category_and_label,
+    normalize_labels,
     validate_clip_path,
 )
 from homeassistant.exceptions import ServiceValidationError
@@ -1549,7 +1550,7 @@ class TestClipMigration:
         await tl._migrate()
 
         assert await tl._has_latest_schema()
-        assert await tl._get_db_version() == DB_VERSION == 5
+        assert await tl._get_db_version() == DB_VERSION
         event = await tl.get_event(uid)
         assert event["title"] == "A car passed"
         assert event["clip"] is None
@@ -1746,3 +1747,313 @@ class TestClipEndToEnd:
 
         assert not os.path.exists(processor.clip)
         assert await tl.get_events_json() == []
+
+
+# ---------------------------------------------------------------------------
+# Category and labels
+# ---------------------------------------------------------------------------
+
+
+class TestNormalizeLabels:
+    def test_strips_lowercases_dedupes_and_keeps_order(self):
+        assert normalize_labels([" Squirrel", "bird feeder", "", "squirrel ", None]) == [
+            "squirrel",
+            "bird feeder",
+        ]
+
+    def test_comma_separated_string(self):
+        assert normalize_labels("Gardener, ladder,,") == ["gardener", "ladder"]
+
+    def test_empty_inputs(self):
+        assert normalize_labels(None) == []
+        assert normalize_labels("") == []
+        assert normalize_labels([]) == []
+
+    def test_free_text_is_kept(self):
+        assert normalize_labels(["robot vacuum"]) == ["robot vacuum"]
+
+
+class TestCategoryAndLabels:
+    async def _create(self, tl, title="Something moved", description="", **kwargs):
+        now = dt_util.utcnow()
+        await tl.create_event(
+            start=now,
+            end=now + datetime.timedelta(minutes=1),
+            title=title,
+            description=description,
+            key_frame="",
+            camera_name="",
+            **kwargs,
+        )
+
+    async def _only_event(self, tl) -> dict:
+        events = await tl.get_events_json(limit=None, include_no_activity=True)
+        assert len(events) == 1
+        return events[0]
+
+    async def test_explicit_category_and_labels(self, build_timeline):
+        tl = build_timeline(retention=0)
+        await tl._initialize_db()
+        await self._create(tl, category="animal", labels=["squirrel", "bird feeder"])
+
+        event = await self._only_event(tl)
+        assert event["category"] == "animal"
+        assert event["labels"] == ["squirrel", "bird feeder"]
+        assert event["label"] == "squirrel"
+        single = await tl.get_event(event["uid"])
+        assert single["labels"] == ["squirrel", "bird feeder"]
+        assert single["category"] == "animal"
+
+    async def test_category_is_not_derived_from_labels(self, build_timeline):
+        tl = build_timeline(retention=0)
+        await tl._initialize_db()
+        # "car" alone would make the category vehicle
+        await self._create(
+            tl, title="A car stopped", category="person", labels=["gardener", "car"]
+        )
+
+        event = await self._only_event(tl)
+        assert event["category"] == "person"
+        assert event["labels"] == ["gardener", "car"]
+
+    async def test_category_is_case_insensitive(self, build_timeline):
+        tl = build_timeline(retention=0)
+        await tl._initialize_db()
+        await self._create(tl, category=" Animal ")
+        assert (await self._only_event(tl))["category"] == "animal"
+
+    async def test_unknown_category_raises_and_stores_nothing(self, build_timeline):
+        tl = build_timeline(retention=0)
+        await tl._initialize_db()
+        with pytest.raises(ServiceValidationError, match="robot"):
+            await self._create(tl, category="robot", labels=["robot"])
+        assert await tl.get_events_json(limit=None, include_no_activity=True) == []
+
+    async def test_category_validated_against_timeline_language(self, build_timeline):
+        tl = build_timeline(retention=0, options={CONF_TIMELINE_LANGUAGE: "German"})
+        await tl._initialize_db()
+        await self._create(tl, category="delivery", labels=["paket"])
+        assert (await self._only_event(tl))["category"] == "delivery"
+
+    async def test_single_label_derives_category(self, build_timeline):
+        tl = build_timeline(retention=0)
+        await tl._initialize_db()
+        await self._create(tl, title="Something", label="Car")
+
+        event = await self._only_event(tl)
+        assert event["category"] == "vehicle"
+        assert event["labels"] == ["car"]
+        assert event["label"] == "car"
+
+    async def test_category_from_first_label_that_maps(self, build_timeline):
+        tl = build_timeline(retention=0)
+        await tl._initialize_db()
+        await self._create(tl, labels=["gardener", "Dog", "car"])
+
+        event = await self._only_event(tl)
+        assert event["category"] == "animal"
+        assert event["labels"] == ["gardener", "dog", "car"]
+        assert event["label"] == "gardener"
+
+    async def test_labels_that_map_to_nothing_give_no_category(self, build_timeline):
+        tl = build_timeline(retention=0)
+        await tl._initialize_db()
+        # The title would give person; labels take precedence
+        await self._create(tl, title="A person on a ladder", labels=["ladder"])
+
+        event = await self._only_event(tl)
+        assert event["category"] == ""
+        assert event["labels"] == ["ladder"]
+
+    async def test_label_goes_before_labels(self, build_timeline):
+        tl = build_timeline(retention=0)
+        await tl._initialize_db()
+        await self._create(tl, label="person", labels=["gardener", "Person"])
+        event = await self._only_event(tl)
+        assert event["labels"] == ["person", "gardener"]
+        assert event["category"] == "person"
+
+    async def test_neither_given_detects_from_text(self, build_timeline):
+        tl = build_timeline(retention=0)
+        await tl._initialize_db()
+        await self._create(tl, title="A dog ran past", category="", labels=[])
+
+        event = await self._only_event(tl)
+        assert event["category"] == "animal"
+        assert event["labels"] == ["dog"]
+        assert event["label"] == "dog"
+
+    async def test_nothing_detected_gives_empty_labels(self, build_timeline):
+        tl = build_timeline(retention=0)
+        await tl._initialize_db()
+        await self._create(tl, title="Nothing in particular")
+
+        event = await self._only_event(tl)
+        assert event["category"] == ""
+        assert event["labels"] == []
+        assert event["label"] == ""
+
+    async def test_comma_separated_labels(self, build_timeline):
+        tl = build_timeline(retention=0)
+        await tl._initialize_db()
+        await self._create(tl, category="person", labels="gardener, ladder")
+        assert (await self._only_event(tl))["labels"] == ["gardener", "ladder"]
+
+    async def test_filters(self, build_timeline):
+        tl = build_timeline(retention=0)
+        await tl._initialize_db()
+        await self._create(tl, title="Squirrel", category="animal", labels=["squirrel", "bird feeder"])
+        await self._create(tl, title="Gardener", category="person", labels=["gardener", "ladder"])
+        # Created before the labels column: label only
+        await _insert_rows(
+            tl._db_path, [_make_row("old car", 0.1, category="vehicle", label="car")]
+        )
+
+        async def titles(**filters):
+            events = await tl.get_events_json(limit=None, **filters)
+            return sorted(e["title"] for e in events)
+
+        assert await titles(labels=["Ladder"]) == ["Gardener"]
+        assert await titles(labels=["bird feeder", "car"]) == ["Squirrel", "old car"]
+        assert await titles(labels=["squirrel"]) == ["Squirrel"]
+        assert await titles(categories=["animal"]) == ["Squirrel"]
+        assert await titles(categories=["person"], labels=["squirrel"]) == []
+
+    async def test_row_without_labels_column_value_loads(self, build_timeline):
+        tl = build_timeline(retention=0)
+        await tl._initialize_db()
+        row = _make_row("old dog", 0.1, category="animal", label="dog")
+        bare = _make_row("old nothing", 0.2)
+        await _insert_rows(tl._db_path, [row, bare])
+
+        await tl.load_events()
+        by_title = {e.title: e for e in tl.events}
+        assert by_title["old dog"].labels == ["dog"]
+        assert by_title["old nothing"].labels == []
+        assert (await tl.get_event(row[0]))["labels"] == ["dog"]
+
+
+class TestUpdateCategoryAndLabels:
+    async def _setup(self, tl) -> str:
+        await tl._initialize_db()
+        now = dt_util.utcnow()
+        await tl.create_event(
+            start=now,
+            end=now + datetime.timedelta(minutes=1),
+            title="Gardener",
+            description="",
+            key_frame="",
+            camera_name="",
+            category="person",
+            labels=["gardener", "ladder"],
+        )
+        return tl.events[0].uid
+
+    async def _update(self, tl, uid, title="Gardener", **kwargs):
+        now = dt_util.utcnow()
+        await tl.update_event(
+            uid=uid,
+            start=now,
+            end=now + datetime.timedelta(minutes=1),
+            title=title,
+            description="",
+            key_frame="",
+            camera_name="",
+            **kwargs,
+        )
+        return await tl.get_event(uid)
+
+    async def test_nothing_given_keeps_category_and_labels(self, build_timeline):
+        tl = build_timeline(retention=0)
+        uid = await self._setup(tl)
+        event = await self._update(tl, uid, title="A car arrived")
+        assert event["title"] == "A car arrived"
+        assert event["category"] == "person"
+        assert event["labels"] == ["gardener", "ladder"]
+        assert event["label"] == "gardener"
+
+    async def test_category_only_keeps_labels(self, build_timeline):
+        tl = build_timeline(retention=0)
+        uid = await self._setup(tl)
+        event = await self._update(tl, uid, category="Nature")
+        assert event["category"] == "nature"
+        assert event["labels"] == ["gardener", "ladder"]
+
+    async def test_labels_only_derive_category(self, build_timeline):
+        tl = build_timeline(retention=0)
+        uid = await self._setup(tl)
+        event = await self._update(tl, uid, labels=["Cat", "ladder"])
+        assert event["category"] == "animal"
+        assert event["labels"] == ["cat", "ladder"]
+        assert event["label"] == "cat"
+
+    async def test_unknown_category_raises_and_keeps_event(self, build_timeline):
+        tl = build_timeline(retention=0)
+        uid = await self._setup(tl)
+        with pytest.raises(ServiceValidationError):
+            await self._update(tl, uid, title="changed", category="robot")
+        event = await tl.get_event(uid)
+        assert event["title"] == "Gardener"
+        assert event["category"] == "person"
+
+
+class TestLabelsMigration:
+    @staticmethod
+    async def _make_v5_db(db_path: str) -> dict[str, str]:
+        """Replace the events table with the v5 schema (no labels)."""
+        rows = {
+            "car": _make_row("A car passed", 0.1, label="car", category="vehicle"),
+            "empty": _make_row("Nothing", 0.2, label="", category=""),
+            "null": _make_row("Null label", 0.3, label=None, category=None),
+        }
+        async with aiosqlite.connect(db_path) as db:
+            await db.execute("DROP TABLE events")
+            await db.execute("""CREATE TABLE events (
+                    uid TEXT PRIMARY KEY, title TEXT, start TEXT, end TEXT,
+                    description TEXT, key_frame TEXT, camera_name TEXT,
+                    category TEXT, label TEXT, clip TEXT
+                )""")
+            for row in rows.values():
+                await db.execute(
+                    "INSERT INTO events VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)", row
+                )
+            await db.execute("PRAGMA user_version = 5")
+            await db.commit()
+        return {key: row[0] for key, row in rows.items()}
+
+    async def test_v5_db_gains_backfilled_labels(self, build_timeline, caplog):
+        tl = build_timeline(retention=0)
+        await tl._initialize_db()
+        uids = await self._make_v5_db(tl._db_path)
+        assert not await tl._has_latest_schema()
+        tl._migrate_to_v5 = AsyncMock()
+
+        tl._migrating = True
+        await tl._startup()
+
+        tl._migrate_to_v5.assert_not_awaited()
+        assert await tl._has_latest_schema()
+        assert await tl._get_db_version() == DB_VERSION == 6
+        async with aiosqlite.connect(tl._db_path) as db:
+            async with db.execute("SELECT uid, labels FROM events") as cursor:
+                stored = dict(await cursor.fetchall())
+        assert stored == {uids["car"]: '["car"]', uids["empty"]: "[]", uids["null"]: "[]"}
+
+        car = await tl.get_event(uids["car"])
+        assert (car["category"], car["label"], car["labels"]) == ("vehicle", "car", ["car"])
+        assert len(tl.events) == 3
+        assert not [r for r in caplog.records if r.levelname == "ERROR"]
+
+    async def test_migration_keeps_existing_labels(self, build_timeline):
+        tl = build_timeline(retention=0)
+        await tl._initialize_db()
+        await TestCategoryAndLabels()._create(
+            tl, category="animal", labels=["squirrel", "bird feeder"]
+        )
+        await tl._set_db_version(5)
+
+        tl._migrating = True
+        await tl._migrate()
+
+        event = (await tl.get_events_json(limit=None))[0]
+        assert event["labels"] == ["squirrel", "bird feeder"]

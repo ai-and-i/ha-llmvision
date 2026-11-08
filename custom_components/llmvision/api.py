@@ -2,6 +2,7 @@ import json
 import logging
 from datetime import datetime, timedelta
 from typing import Any, Optional
+from homeassistant.exceptions import ServiceValidationError
 from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.helpers.http import HomeAssistantView
 from homeassistant.helpers.json import json_dumps
@@ -45,6 +46,7 @@ class TimelineEventsView(HomeAssistantView):
 
         cameras = request.query.get("cameras", None)
         categories = request.query.get("categories", None)
+        labels = request.query.get("labels", None)
         days = request.query.get("days", None)
         hours = request.query.get("hours", None)
         include_no_activity_raw = request.query.get("include_no_activity", "false")
@@ -64,6 +66,7 @@ class TimelineEventsView(HomeAssistantView):
 
         cameras = _parse_list_param(cameras)
         categories = _parse_list_param(categories)
+        labels = _parse_list_param(labels)
 
         # Parse start/end params (ISO datetime strings)
         start = request.query.get("start", None)
@@ -106,6 +109,7 @@ class TimelineEventsView(HomeAssistantView):
             limit=limit,
             cameras=cameras,
             categories=categories,
+            labels=labels,
             start=start,
             end=end,
             include_no_activity=include_no_activity,
@@ -137,6 +141,8 @@ class TimelineEventCreateView(HomeAssistantView):
         key_frame = data.get("key_frame") or ""
         camera_name = data.get("camera_name") or data.get("camera_entity") or ""
         label = data.get("label") or ""
+        category = data.get("category")
+        labels = data.get("labels")
 
         # Times: accept ISO strings or timestamps; default to now..now+1min
         def _parse_time(val):
@@ -169,8 +175,12 @@ class TimelineEventCreateView(HomeAssistantView):
                 description=description,
                 key_frame=key_frame,
                 camera_name=camera_name,
-                label=label.lower(),
+                label=label,
+                category=category,
+                labels=labels,
             )
+        except ServiceValidationError as e:
+            return self.json_message(str(e), status_code=400)
         except Exception as e:
             _LOGGER.error(f"Error creating timeline event: {e}")
             return self.json_message("Error creating event", status_code=500)
@@ -270,7 +280,6 @@ class TimelineEventView(HomeAssistantView):
                 "camera_name",
                 data.get("camera_entity", existing.get("camera_name", "")),
             ),
-            "label": data.get("label", existing.get("label", "")),
         }
 
         start_in = data.get("start", existing.get("start"))
@@ -290,8 +299,13 @@ class TimelineEventView(HomeAssistantView):
                 description=fields["description"],
                 key_frame=fields["key_frame"],
                 camera_name=fields["camera_name"],
-                label=fields["label"].lower(),
+                # None keeps the event's category and labels
+                label=data.get("label"),
+                category=data.get("category"),
+                labels=data.get("labels"),
             )
+        except ServiceValidationError as e:
+            return self.json_message(str(e), status_code=400)
         except Exception as e:
             _LOGGER.error(f"Error updating event {event_id}: {e}")
             return self.json_message("Error updating event", status_code=500)
