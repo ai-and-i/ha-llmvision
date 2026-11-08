@@ -5,6 +5,7 @@ import os
 import asyncio
 from unittest.mock import Mock, patch, AsyncMock, MagicMock
 from homeassistant.components.calendar import CalendarEvent
+from homeassistant.helpers.debounce import Debouncer
 
 
 class MockTimelineEvent:
@@ -260,13 +261,23 @@ class TestCalendar:
 
     @pytest.mark.asyncio
     async def test_pending_refresh_cancelled_on_removal(self, calendar_instance):
-        """Removing the entity shuts the debouncer down to cancel a pending refresh."""
-        debouncer = AsyncMock()
+        """Removing the entity shuts the debouncer down to cancel a pending refresh.
+
+        Uses Home Assistant's real Debouncer: its async_shutdown is a plain
+        callback, so awaiting it raised TypeError and broke entry reloads.
+        """
+        debouncer = Debouncer(
+            calendar_instance.hass,
+            Mock(),
+            cooldown=1,
+            immediate=False,
+            function=calendar_instance._async_refresh_state,
+        )
         calendar_instance._refresh_debouncer = debouncer
 
         await calendar_instance.async_will_remove_from_hass()
 
-        debouncer.async_shutdown.assert_awaited_once()
+        assert debouncer._shutdown_requested is True
 
 
 class TestCalendarAdvanced:

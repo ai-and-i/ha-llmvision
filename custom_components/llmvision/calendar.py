@@ -87,7 +87,8 @@ class Calendar(CalendarEntity):
     async def async_will_remove_from_hass(self) -> None:
         """Cancel any pending debounced refresh when the entity is removed."""
         if self._refresh_debouncer is not None:
-            await self._refresh_debouncer.async_shutdown()
+            # A plain callback in Home Assistant, not a coroutine
+            self._refresh_debouncer.async_shutdown()
 
     @property
     def extra_state_attributes(self) -> dict:  # type: ignore
