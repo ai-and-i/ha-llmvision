@@ -4,6 +4,10 @@ from unittest.mock import Mock, patch, AsyncMock, MagicMock
 from PIL import Image
 import io
 import base64
+import json
+import os
+import shutil
+import subprocess
 from types import SimpleNamespace
 from homeassistant.exceptions import ServiceValidationError
 from custom_components.llmvision.media_handlers import MediaProcessor
@@ -700,6 +704,414 @@ class TestMediaProcessor:
                 include_filename=False,
                 expose_images=False,
             )
+
+    @staticmethod
+    def _fake_ffmpeg(payload):
+        """ffmpeg process stub that emits payload on stdout, then EOF."""
+
+        class FakeStdout:
+            def __init__(self):
+                self._chunks = [payload, b""]
+
+            async def read(self, _size):
+                return self._chunks.pop(0) if self._chunks else b""
+
+        class FakeProcess:
+            pid = 99
+            stderr = None
+            returncode = 0
+
+            def __init__(self):
+                self.stdout = FakeStdout()
+
+            async def wait(self):
+                return self.returncode
+
+        return FakeProcess()
+
+    @staticmethod
+    def _run_executor_inline(processor):
+        processor.hass.loop.run_in_executor.side_effect = (
+            lambda _executor, func, *args: func(*args)
+        )
+
+    @pytest.mark.asyncio
+    async def test_add_video_variable_mode_uses_keyframes(self, processor):
+        """Variable mode (the default) extracts I-frames with no frame limit."""
+        self._run_executor_inline(processor)
+        processor.resize_image = AsyncMock(return_value="encoded")
+        exec_mock = AsyncMock(
+            return_value=self._fake_ffmpeg(_make_jpeg_bytes("black"))
+        )
+
+        with patch(
+            "custom_components.llmvision.media_handlers.asyncio.create_subprocess_exec",
+            exec_mock,
+        ):
+            await processor.add_video(
+                video_path="/tmp/clip.mp4", base_url="http://ha.local", max_frames=3
+            )
+
+        cmd = exec_mock.await_args.args
+        assert cmd[cmd.index("-vf") + 1] == "select=eq(pict_type\\,I)"
+        assert "-frames:v" not in cmd
+
+    @pytest.mark.asyncio
+    async def test_add_video_constant_mode_samples_at_fps_up_to_max_frames(
+        self, processor
+    ):
+        """Constant mode samples at fps, scales, and stops ffmpeg after max_frames."""
+        self._run_executor_inline(processor)
+        processor.resize_image = AsyncMock(return_value="encoded")
+        exec_mock = AsyncMock(
+            return_value=self._fake_ffmpeg(_make_jpeg_bytes("black"))
+        )
+
+        with patch(
+            "custom_components.llmvision.media_handlers.asyncio.create_subprocess_exec",
+            exec_mock,
+        ):
+            await processor.add_video(
+                video_path="/tmp/clip.mp4",
+                base_url="http://ha.local",
+                max_frames=30,
+                target_width=640,
+                fps_mode="constant",
+                fps=0.5,
+            )
+
+        cmd = exec_mock.await_args.args
+        assert cmd[cmd.index("-vf") + 1] == "fps=0.5,scale='trunc(min(iw,640)/2)*2':-2"
+        assert cmd[cmd.index("-frames:v") + 1] == "30"
+
+    @pytest.mark.asyncio
+    async def test_add_video_constant_mode_keeps_every_frame_in_order(
+        self, processor
+    ):
+        """Constant mode sends all frames in capture order, without scoring them."""
+        self._run_executor_inline(processor)
+        colors = ["black", "gray", "white", "red", "blue"]
+        frames = [_make_jpeg_bytes(color) for color in colors]
+        encoded_by_frame = {frame: color for frame, color in zip(frames, colors)}
+        processor._similarity_score = Mock()
+        processor.resize_image = AsyncMock(
+            side_effect=lambda target_width, image_data=None, **kwargs: encoded_by_frame[
+                image_data
+            ]
+        )
+
+        with patch(
+            "custom_components.llmvision.media_handlers.asyncio.create_subprocess_exec",
+            AsyncMock(return_value=self._fake_ffmpeg(b"".join(frames))),
+        ):
+            await processor.add_video(
+                video_path="/tmp/clip.mp4",
+                base_url="http://ha.local",
+                max_frames=4,  # ffmpeg enforces this; the extra frame checks the cap
+                fps_mode="constant",
+                fps=1,
+            )
+
+        processor._similarity_score.assert_not_called()
+        assert [
+            call.kwargs["base64_image"]
+            for call in processor.client.add_frame.call_args_list
+        ] == ["black", "gray", "white", "red"]
+
+    @pytest.mark.asyncio
+    async def test_add_video_variable_mode_scores_frames_beyond_max_frames(
+        self, processor
+    ):
+        """In variable mode every keyframe is a candidate, not only the first max_frames."""
+        self._run_executor_inline(processor)
+        colors = ["black", "gray", "white", "red", "blue"]
+        frames = [_make_jpeg_bytes(color) for color in colors]
+        encoded_by_frame = {frame: color for frame, color in zip(frames, colors)}
+        # Frames 1-4 are scored; "blue" (index 4) changed most
+        processor._similarity_score = Mock(side_effect=[0.9, 0.8, 0.7, 0.1])
+        processor.resize_image = AsyncMock(
+            side_effect=lambda target_width, image_data=None, **kwargs: encoded_by_frame[
+                image_data
+            ]
+        )
+
+        # All five frames arrive in one stdout read
+        with patch(
+            "custom_components.llmvision.media_handlers.asyncio.create_subprocess_exec",
+            AsyncMock(return_value=self._fake_ffmpeg(b"".join(frames))),
+        ):
+            await processor.add_video(
+                video_path="/tmp/clip.mp4",
+                base_url="http://ha.local",
+                max_frames=2,
+                target_width=128,
+            )
+
+        assert processor._similarity_score.call_count == 4
+        assert [
+            call.kwargs["base64_image"]
+            for call in processor.client.add_frame.call_args_list
+        ] == ["black", "blue"]
+
+    @pytest.mark.asyncio
+    async def test_add_video_constant_mode_attaches_frames_as_video(self, processor):
+        """encode_video turns the extracted frames into a clip, alongside the images."""
+        self._run_executor_inline(processor)
+        frames = [_make_jpeg_bytes("black"), _make_jpeg_bytes("white")]
+        processor.resize_image = AsyncMock(return_value="encoded-frame")
+        processor._encode_video = AsyncMock(return_value=b"mp4-bytes")
+
+        with patch(
+            "custom_components.llmvision.media_handlers.asyncio.create_subprocess_exec",
+            AsyncMock(return_value=self._fake_ffmpeg(b"".join(frames))),
+        ):
+            await processor.add_video(
+                video_path="/media/clips/front_door.mp4",
+                base_url="http://ha.local",
+                max_frames=10,
+                target_width=640,
+                include_filename=True,
+                fps_mode="constant",
+                fps=2,
+                encode_video=True,
+            )
+
+        # The raw ffmpeg JPEGs, not the resized base64 images
+        processor._encode_video.assert_awaited_once_with(jpeg_frames=frames, fps=2)
+        processor.client.add_video_clip.assert_called_once_with(
+            base64_video=base64.b64encode(b"mp4-bytes").decode("utf-8"),
+            filename="front_door",
+            fps=2,
+        )
+        # Images are still added for providers without video support
+        assert processor.client.add_frame.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_add_video_variable_mode_never_encodes_video(self, processor):
+        """encode_video has no effect in variable mode."""
+        self._run_executor_inline(processor)
+        processor.resize_image = AsyncMock(return_value="encoded-frame")
+        processor._encode_video = AsyncMock(return_value=b"mp4")
+
+        with patch(
+            "custom_components.llmvision.media_handlers.asyncio.create_subprocess_exec",
+            AsyncMock(return_value=self._fake_ffmpeg(_make_jpeg_bytes("black"))),
+        ):
+            await processor.add_video(
+                video_path="/tmp/clip.mp4",
+                base_url="http://ha.local",
+                encode_video=True,
+            )
+
+        processor._encode_video.assert_not_awaited()
+        processor.client.add_video_clip.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_add_video_skips_clip_when_encoding_fails(self, processor):
+        """A failed encode leaves only the images."""
+        self._run_executor_inline(processor)
+        processor.resize_image = AsyncMock(return_value="encoded-frame")
+        processor._encode_video = AsyncMock(return_value=None)
+
+        with patch(
+            "custom_components.llmvision.media_handlers.asyncio.create_subprocess_exec",
+            AsyncMock(return_value=self._fake_ffmpeg(_make_jpeg_bytes("black"))),
+        ):
+            await processor.add_video(
+                video_path="/tmp/clip.mp4",
+                base_url="http://ha.local",
+                fps_mode="constant",
+                encode_video=True,
+            )
+
+        processor.client.add_video_clip.assert_not_called()
+        processor.client.add_frame.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_add_video_skips_clip_over_inline_limit(self, processor):
+        """A clip too large to send inline is dropped in favour of the images."""
+        self._run_executor_inline(processor)
+        processor.resize_image = AsyncMock(return_value="encoded-frame")
+        processor._encode_video = AsyncMock(return_value=b"x" * 30)
+
+        with patch(
+            "custom_components.llmvision.media_handlers.MAX_INLINE_VIDEO_BYTES", 32
+        ), patch(
+            "custom_components.llmvision.media_handlers.asyncio.create_subprocess_exec",
+            AsyncMock(return_value=self._fake_ffmpeg(_make_jpeg_bytes("black"))),
+        ):
+            # 30 bytes is 40 characters of base64
+            await processor.add_video(
+                video_path="/tmp/clip.mp4",
+                base_url="http://ha.local",
+                fps_mode="constant",
+                encode_video=True,
+            )
+
+        processor.client.add_video_clip.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_add_video_removes_downloaded_copy(self, processor, tmp_path):
+        """A remote clip's downloaded copy is deleted once frames are taken."""
+        self._run_executor_inline(processor)
+        download = tmp_path / "download.mp4"
+
+        class FakeTempFile:
+            name = str(download)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        async def fake_fetch(_url, target_file=None, **kwargs):
+            with open(target_file, "wb") as f:
+                f.write(b"video")
+
+        processor._fetch = fake_fetch
+        processor._encode_video = AsyncMock(return_value=b"mp4")
+        processor.resize_image = AsyncMock(return_value="encoded-frame")
+
+        with patch(
+            "custom_components.llmvision.media_handlers.tempfile.NamedTemporaryFile",
+            return_value=FakeTempFile(),
+        ), patch(
+            "custom_components.llmvision.media_handlers.asyncio.create_subprocess_exec",
+            AsyncMock(return_value=self._fake_ffmpeg(_make_jpeg_bytes("black"))),
+        ):
+            await processor.add_video(
+                video_path="https://example.com/clip.mp4",
+                base_url="http://ha.local",
+                fps_mode="constant",
+                encode_video=True,
+            )
+
+        assert not download.exists()
+        processor.client.add_video_clip.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_encode_video_returns_none_when_ffmpeg_fails(self, processor):
+        """A non-zero ffmpeg exit returns None and removes the output file."""
+
+        class FailedProcess:
+            returncode = 1
+
+            async def communicate(self, _input=None):
+                return b"", b"Unknown encoder 'libx264'"
+
+        created = []
+        real_named_temp = __import__("tempfile").NamedTemporaryFile
+
+        def tracking_temp(**kwargs):
+            tmp = real_named_temp(**kwargs)
+            created.append(tmp.name)
+            return tmp
+
+        with patch(
+            "custom_components.llmvision.media_handlers.tempfile.NamedTemporaryFile",
+            side_effect=tracking_temp,
+        ), patch(
+            "custom_components.llmvision.media_handlers.asyncio.create_subprocess_exec",
+            AsyncMock(return_value=FailedProcess()),
+        ):
+            result = await processor._encode_video([_make_jpeg_bytes("black")], 1)
+
+        assert result is None
+        assert created and not os.path.exists(created[0])
+
+    @pytest.mark.skipif(
+        not (shutil.which("ffmpeg") and shutil.which("ffprobe")),
+        reason="needs ffmpeg and ffprobe",
+    )
+    @pytest.mark.asyncio
+    async def test_constant_mode_with_real_ffmpeg(self, processor, tmp_path):
+        """End to end: frames at fps, cut at max_frames, and the same frames as video."""
+        self._run_executor_inline(processor)
+        source = tmp_path / "source.mp4"
+        # 6 seconds with audio, at an odd size
+        subprocess.run(
+            [
+                "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                "-f", "lavfi", "-i", "testsrc2=size=1281x721:rate=25:duration=6",
+                "-f", "lavfi", "-i", "sine=duration=6",
+                "-c:v", "libx264", "-c:a", "aac", "-shortest", str(source),
+            ],
+            check=True,
+        )
+        clips = []
+        processor.client.add_video_clip = Mock(
+            side_effect=lambda **kwargs: clips.append(kwargs)
+        )
+
+        await processor.add_video(
+            video_path=str(source),
+            base_url="http://ha.local",
+            max_frames=3,
+            target_width=640,
+            fps_mode="constant",
+            fps=1,
+            encode_video=True,
+        )
+
+        assert processor.client.add_frame.call_count == 3
+        sizes = {
+            Image.open(io.BytesIO(base64.b64decode(c.kwargs["base64_image"]))).size
+            for c in processor.client.add_frame.call_args_list
+        }
+        assert sizes == {(640, 360)}
+
+        output = tmp_path / "output.mp4"
+        output.write_bytes(base64.b64decode(clips[0]["base64_video"]))
+        probe = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-show_entries",
+                "stream=codec_type,width,height,r_frame_rate,nb_frames:format=duration",
+                "-of", "json", str(output),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        info = json.loads(probe.stdout)
+        assert info["streams"] == [
+            {
+                "codec_type": "video",
+                "width": 640,
+                "height": 360,
+                "r_frame_rate": "1/1",
+                "nb_frames": "3",
+            }
+        ]
+        # The first 3 seconds of the 6-second clip; the rest is dropped
+        assert float(info["format"]["duration"]) == pytest.approx(3.0)
+
+    @pytest.mark.asyncio
+    async def test_add_videos_passes_mode_fps_and_encode_video(self, processor):
+        """add_videos forwards fps_mode, fps and encode_video to each add_video call."""
+        processor.add_video = AsyncMock()
+
+        with patch(
+            "custom_components.llmvision.media_handlers.get_url",
+            return_value="http://ha.local",
+        ):
+            await processor.add_videos(
+                video_paths=["/tmp/local.mp4"],
+                event_ids=None,
+                max_frames=2,
+                target_width=128,
+                include_filename=False,
+                expose_images=False,
+                fps_mode="constant",
+                fps=1,
+                encode_video=True,
+            )
+
+        kwargs = processor.add_video.await_args.kwargs
+        assert kwargs["fps_mode"] == "constant"
+        assert kwargs["fps"] == 1
+        assert kwargs["encode_video"] is True
 
     @pytest.mark.asyncio
     async def test_add_videos_processes_event_ids(self, processor):

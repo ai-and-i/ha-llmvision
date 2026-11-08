@@ -71,6 +71,10 @@ DURATION = "duration"
 FRIGATE_RETRY_ATTEMPTS = "frigate_retry_attempts"
 FRIGATE_RETRY_SECONDS = "frigate_retry_seconds"
 MAX_FRAMES = "max_frames"
+FPS = "fps"
+FPS_MODE = "fps_mode"
+FPS_MODE_VARIABLE = "variable"  # max_frames frames with the most change
+FPS_MODE_CONSTANT = "constant"  # one frame every 1/fps seconds, up to max_frames
 RESPONSE_FORMAT = "response_format"
 STRUCTURE = "structure"
 TITLE_FIELD = "title_field"
@@ -80,6 +84,9 @@ INCLUDE_FILENAME = "include_filename"
 EXPOSE_IMAGES = "expose_images"
 GENERATE_TITLE = "generate_title"
 SENSOR_ENTITY = "sensor_entity"
+
+# Largest base64 video sent inline; Gemini advises inline requests stay under 20 MB
+MAX_INLINE_VIDEO_BYTES = 18 * 1024 * 1024
 
 # Error messages
 ERROR_NOT_CONFIGURED = "{provider} is not configured"

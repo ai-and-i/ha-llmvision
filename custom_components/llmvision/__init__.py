@@ -1,6 +1,6 @@
 from datetime import datetime
 from .timeline import Timeline
-from .providers import Request
+from .providers import ProviderFactory, Request
 from .memory import Memory
 from .media_handlers import MediaProcessor
 import os, re
@@ -54,6 +54,10 @@ from .const import (
     INTERVAL,
     DURATION,
     MAX_FRAMES,
+    FPS,
+    FPS_MODE,
+    FPS_MODE_CONSTANT,
+    FPS_MODE_VARIABLE,
     INCLUDE_FILENAME,
     EXPOSE_IMAGES,
     GENERATE_TITLE,
@@ -473,6 +477,17 @@ class ServiceCallData:
         self.interval: int = int(data_call.data.get(INTERVAL, 2))
         self.duration: int = int(data_call.data.get(DURATION, 10))
         self.max_frames: int = int(data_call.data.get(MAX_FRAMES, 3))
+        # How video_analyzer takes frames; fps only applies in constant mode
+        self.fps_mode: str = data_call.data.get(FPS_MODE) or FPS_MODE_VARIABLE
+        if self.fps_mode not in (FPS_MODE_VARIABLE, FPS_MODE_CONSTANT):
+            raise ServiceValidationError(
+                f"fps_mode must be '{FPS_MODE_VARIABLE}' or '{FPS_MODE_CONSTANT}', "
+                f"got '{self.fps_mode}'"
+            )
+        fps = data_call.data.get(FPS)
+        self.fps: float = 1.0 if fps is None else float(fps)
+        if self.fps_mode == FPS_MODE_CONSTANT and self.fps <= 0:
+            raise ServiceValidationError(f"fps must be greater than 0, got {fps}")
         self.target_width: int = data_call.data.get(TARGET_WIDTH, 3840)
         self.temperature: float = float()
         self.max_tokens: int = int(data_call.data.get(MAXTOKENS, 3000))
@@ -724,14 +739,32 @@ def setup(hass, config):
         """Handle the service call to analyze a video (future implementation)"""
         start = dt_util.now()
         call = ServiceCallData(data_call).get_service_call_data()
-        call.message = "The attached images are frames from a video. " + call.message
-
         request = Request(
             hass,
             message=call.message,
             max_tokens=call.max_tokens,
             temperature=call.temperature,
         )
+        constant_fps = call.fps_mode == FPS_MODE_CONSTANT
+        # In constant mode, providers that take video natively get the frames
+        # as a video. The frames are still sent for fallback providers.
+        encode_video = constant_fps and ProviderFactory.supports_video_input(
+            Request.get_provider(hass, call.provider),
+            call.model or request.get_default_model(call.provider),
+        )
+        if encode_video:
+            # A fallback provider gets frames instead, so this must fit both
+            prefix = f"The attached media is from a video, sampled at {call.fps:g} fps. "
+        elif constant_fps:
+            prefix = (
+                "The attached images are consecutive frames from a video, "
+                f"taken at {call.fps:g} fps. "
+            )
+        else:
+            prefix = "The attached images are frames from a video. "
+        call.message = prefix + call.message
+        request.message = call.message
+
         processor = MediaProcessor(hass, request)
         request = await processor.add_videos(
             video_paths=call.video_paths,
@@ -740,6 +773,9 @@ def setup(hass, config):
             target_width=call.target_width,
             include_filename=call.include_filename,
             expose_images=call.expose_images,
+            fps_mode=call.fps_mode,
+            fps=call.fps,
+            encode_video=encode_video,
         )
         call.memory = Memory(hass)
         await call.memory._update_memory()

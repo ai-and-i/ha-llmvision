@@ -163,6 +163,36 @@ class TestServiceCallData:
         call = ServiceCallData(_build_data_call(_base_service_data()))
         assert call.system_prompt is None
 
+    def test_fps_mode_defaults_to_variable_at_one_fps(self):
+        call = ServiceCallData(_build_data_call(_base_service_data()))
+        assert call.fps_mode == "variable"
+        assert call.fps == 1.0
+
+    @pytest.mark.parametrize(("value", "expected"), [(1, 1.0), (0.5, 0.5), ("2", 2.0)])
+    def test_fps_from_service_data(self, value, expected):
+        call = ServiceCallData(
+            _build_data_call(_base_service_data(fps_mode="constant", fps=value))
+        )
+        assert call.fps_mode == "constant"
+        assert call.fps == expected
+
+    @pytest.mark.parametrize("value", [0, -1])
+    def test_constant_mode_rejects_non_positive_fps(self, value):
+        with pytest.raises(ServiceValidationError, match="fps must be greater than 0"):
+            ServiceCallData(
+                _build_data_call(_base_service_data(fps_mode="constant", fps=value))
+            )
+
+    def test_variable_mode_ignores_fps(self):
+        call = ServiceCallData(
+            _build_data_call(_base_service_data(fps_mode="variable", fps=0))
+        )
+        assert call.fps_mode == "variable"
+
+    def test_unknown_fps_mode_raises(self):
+        with pytest.raises(ServiceValidationError, match="fps_mode must be"):
+            ServiceCallData(_build_data_call(_base_service_data(fps_mode="fast")))
+
     @pytest.mark.parametrize(
         "value", [1704110400, 1704110400.0, "1704110400", "2024-01-01T12:00:00"]
     )
@@ -574,6 +604,76 @@ class TestSetupServices:
         assert video_result["key_frame"] == "frame.jpg"
         assert stream_result["key_frame"] == "frame.jpg"
         assert create_event_mock.await_count == 3
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize(
+        ("provider_name", "model", "fps_mode", "expected_encode", "expected_prefix"),
+        [
+            (
+                "Google", "gemini-2.5-flash", "constant", True,
+                "The attached media is from a video, sampled at 2 fps. ",
+            ),
+            (
+                # The default model is a Gemini model
+                "Google", None, "constant", True,
+                "The attached media is from a video, sampled at 2 fps. ",
+            ),
+            (
+                "Google", "gemini-2.5-flash", "variable", False,
+                "The attached images are frames from a video. ",
+            ),
+            (
+                "Google", "gemma-3-27b-it", "constant", False,
+                "The attached images are consecutive frames from a video, taken at 2 fps. ",
+            ),
+            (
+                "OpenAI", "gpt-4o", "constant", False,
+                "The attached images are consecutive frames from a video, taken at 2 fps. ",
+            ),
+            (
+                "OpenAI", "gpt-4o", "variable", False,
+                "The attached images are frames from a video. ",
+            ),
+        ],
+    )
+    async def test_video_analyzer_modes(
+        self, provider_name, model, fps_mode, expected_encode, expected_prefix
+    ):
+        hass = _make_hass()
+        assert setup(hass, {}) is True
+        handlers = self._registered_handlers(hass)
+
+        call_obj = ServiceCallData(
+            _build_data_call(
+                _base_service_data(message="msg", model=model, fps_mode=fps_mode, fps=2)
+            )
+        )
+        request_obj = Mock()
+        request_obj.call = AsyncMock(return_value={"response_text": "ok"})
+        request_obj.get_default_model = Mock(return_value="gemini-2.5-flash")
+        request_cls = Mock(return_value=request_obj)
+        request_cls.get_provider = Mock(return_value=provider_name)
+        memory_obj = Mock()
+        memory_obj._update_memory = AsyncMock()
+        processor = Mock()
+        processor.key_frame = ""
+        processor.add_videos = AsyncMock(return_value=request_obj)
+
+        with (
+            patch("custom_components.llmvision.ServiceCallData", return_value=call_obj),
+            patch("custom_components.llmvision.Request", request_cls),
+            patch("custom_components.llmvision.MediaProcessor", return_value=processor),
+            patch("custom_components.llmvision.Memory", return_value=memory_obj),
+            patch("custom_components.llmvision._create_event", new=AsyncMock()),
+        ):
+            await handlers["video_analyzer"](_build_data_call(_base_service_data()))
+
+        kwargs = processor.add_videos.await_args.kwargs
+        assert kwargs["fps_mode"] == fps_mode
+        assert kwargs["fps"] == 2.0
+        assert kwargs["encode_video"] is expected_encode
+        assert call_obj.message == expected_prefix + "msg"
+        assert request_obj.message == call_obj.message
 
     @pytest.mark.anyio
     async def test_data_analyzer_boolean_and_number_and_text_and_option(self):

@@ -2848,5 +2848,111 @@ async def test_request_call_title_message_does_not_repeat_title_prompt(
     assert seen["message"] == "Create a title for this text: A person at the door"
 
 
+
+def _video(fps=1, filename=""):
+    return {"data": "dmlk", "filename": filename, "fps": fps, "mime_type": "video/mp4"}
+
+
+def _inline_parts(payload):
+    return [p["inline_data"] for p in payload["contents"][0]["parts"] if "inline_data" in p]
+
+
+def test_google_sends_video_instead_of_frames(coverage_hass):
+    google = Google(coverage_hass, "k", "gemini-2.5-flash")
+
+    payload = google._prepare_vision_data(make_coverage_call(videos=[_video()]))
+
+    parts = payload["contents"][0]["parts"]
+    assert parts == [
+        {"text": "Video 1:"},
+        {"inline_data": {"mime_type": "video/mp4", "data": "dmlk"}},
+        {"text": "hello"},
+    ]
+
+
+def test_google_sets_video_fps_when_not_default(coverage_hass):
+    google = Google(coverage_hass, "k", "gemini-2.5-flash")
+
+    payload = google._prepare_vision_data(
+        make_coverage_call(videos=[_video(fps=2, filename="front_door")])
+    )
+
+    parts = payload["contents"][0]["parts"]
+    assert parts[0] == {"text": "front_door:"}
+    assert parts[1]["video_metadata"] == {"fps": 2}
+
+
+def test_google_without_videos_sends_frames(coverage_hass):
+    google = Google(coverage_hass, "k", "gemini-2.5-flash")
+
+    payload = google._prepare_vision_data(make_coverage_call(videos=[]))
+
+    assert _inline_parts(payload) == [{"mime_type": "image/jpeg", "data": "aW1n"}]
+
+
+def test_google_gemma_model_sends_frames_even_with_video(coverage_hass):
+    google = Google(coverage_hass, "k", "gemma-3-27b-it")
+
+    payload = google._prepare_vision_data(make_coverage_call(videos=[_video()]))
+
+    assert _inline_parts(payload) == [{"mime_type": "image/jpeg", "data": "aW1n"}]
+
+
+def test_other_providers_ignore_videos(coverage_hass):
+    openai = OpenAI(coverage_hass, "k", "gpt-4o")
+
+    payload = openai._prepare_vision_data(make_coverage_call(videos=[_video()]))
+
+    assert "dmlk" not in json.dumps(payload)
+    assert "aW1n" in json.dumps(payload)
+
+
+@pytest.mark.parametrize(
+    ("provider_name", "model", "expected"),
+    [
+        ("Google", "gemini-2.5-flash", True),
+        ("Google", "models/Gemini-3-Pro", True),
+        ("Google", "gemma-3-27b-it", False),
+        ("Google", None, False),
+        ("OpenAI", "gpt-4o", False),
+        ("OpenRouter", "google/gemini-2.5-flash", False),
+        (None, "gemini-2.5-flash", False),
+    ],
+)
+def test_provider_factory_supports_video_input(provider_name, model, expected):
+    assert ProviderFactory.supports_video_input(provider_name, model) is expected
+
+
+def test_request_add_video_clip(coverage_hass):
+    req = Request(coverage_hass, "m", 10, 0.2)
+
+    req.add_video_clip(base64_video="dmlk", filename="cam", fps=1)
+
+    assert req.videos == [
+        {"data": "dmlk", "filename": "cam", "fps": 1, "mime_type": "video/mp4"}
+    ]
+
+
+@pytest.mark.anyio
+async def test_request_call_passes_videos_to_provider(monkeypatch, coverage_hass):
+    seen = {}
+
+    class CapturingProvider(DummyProvider):
+        async def vision_request(self, call):
+            seen["videos"] = call.videos
+            return "ok"
+
+    req = Request(coverage_hass, "m", 10, 0.2)
+    req.add_frame("aW1n", "Video frame 1")
+    req.add_video_clip(base64_video="dmlk", filename="", fps=1)
+    monkeypatch.setattr(
+        ProviderFactory, "create", lambda **kwargs: CapturingProvider()
+    )
+
+    await req.call(make_coverage_call())
+
+    assert seen["videos"] == [_video()]
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

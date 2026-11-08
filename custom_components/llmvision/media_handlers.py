@@ -22,9 +22,25 @@ import numpy as np
 from homeassistant.helpers.network import get_url
 from homeassistant.exceptions import ServiceValidationError
 
-from .const import DOMAIN
+from .const import DOMAIN, FPS_MODE_CONSTANT, FPS_MODE_VARIABLE, MAX_INLINE_VIDEO_BYTES
 
 _LOGGER = logging.getLogger(__name__)
+
+# Seconds allowed for encoding one clip
+VIDEO_ENCODE_TIMEOUT = 300
+
+
+def _scale_filter(target_width):
+    """ffmpeg filter that downscales to target_width, keeping both sides even.
+
+    Smaller videos are left at their size; H.264 needs even dimensions.
+    """
+    return f"scale='trunc(min(iw,{int(target_width)})/2)*2':-2"
+
+
+def _read_file(path):
+    with open(path, "rb") as f:
+        return f.read()
 
 
 class MediaProcessor:
@@ -607,6 +623,81 @@ class MediaProcessor:
                     raise ServiceValidationError(f"Error: {e}")
         return self.client
 
+    async def _encode_video(self, jpeg_frames, fps):
+        """Encode JPEG frames as an H.264 MP4 playing at fps.
+
+        The frames become the video as they are, so a provider sent the video
+        sees the same frames as one sent images. Their dimensions must be even
+        (see _scale_filter). Returns the MP4 bytes, or None when ffmpeg fails,
+        so that the caller can send the frames as images instead.
+        """
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
+            output_path = tmp.name
+        ffmpeg_cmd = [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",  # output_path already exists
+            "-f",
+            "image2pipe",
+            "-framerate",
+            f"{fps:g}",
+            "-c:v",
+            "mjpeg",
+            "-i",
+            "-",  # frames arrive on stdin
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "28",
+            "-pix_fmt",
+            "yuv420p",  # what players and APIs expect from H.264
+            "-movflags",
+            "+faststart",
+            output_path,
+        ]
+        try:
+            _LOGGER.debug(
+                f"Running FFMPEG to encode {len(jpeg_frames)} frames as video: {' '.join(ffmpeg_cmd)}"
+            )
+            try:
+                process = await asyncio.create_subprocess_exec(
+                    *ffmpeg_cmd,
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+            except OSError as e:
+                _LOGGER.warning(f"Could not start ffmpeg to encode video: {e}")
+                return None
+            try:
+                _, stderr = await asyncio.wait_for(
+                    process.communicate(b"".join(jpeg_frames)),
+                    timeout=VIDEO_ENCODE_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                process.kill()
+                await process.wait()
+                _LOGGER.warning(
+                    f"Encoding frames as video took over {VIDEO_ENCODE_TIMEOUT} seconds; sending images instead"
+                )
+                return None
+            if process.returncode != 0:
+                _LOGGER.warning(
+                    f"ffmpeg could not encode frames as video (return code {process.returncode}); "
+                    f"sending images instead: {(stderr or b'').decode(errors='ignore').strip()}"
+                )
+                return None
+            return await self.hass.loop.run_in_executor(None, _read_file, output_path)
+        finally:
+            try:
+                os.remove(output_path)
+            except OSError:
+                pass
+
     async def add_video(
         self,
         video_path,
@@ -615,7 +706,20 @@ class MediaProcessor:
         target_width=640,
         include_filename=False,
         expose_images=False,
+        fps_mode=FPS_MODE_VARIABLE,
+        fps=1,
+        encode_video=False,
     ):
+        """Add frames from a video to the client.
+
+        Variable mode: from the video's keyframes (I-frames), the first frame
+        plus the max_frames - 1 frames that changed most.
+        Constant mode: one frame every 1/fps seconds from the start, up to
+        max_frames; the rest of the video is not used. With encode_video,
+        those frames are also attached as a video, for providers that take
+        video natively.
+        """
+        temp_file_path = None
         try:
             current_event_id = str(uuid.uuid4())
             video_path = video_path.strip()
@@ -641,9 +745,19 @@ class MediaProcessor:
 
                 video_path = base_url + video_path
 
+            constant_fps = fps_mode == FPS_MODE_CONSTANT
+            if constant_fps:
+                # Evenly spaced frames, scaled for both images and video.
+                # ffmpeg stops after max_frames, dropping the rest of the video.
+                frame_filter = f"fps={fps:g},{_scale_filter(target_width)}"
+                frame_limit = ["-frames:v", str(max_frames)]
+            else:
+                frame_filter = "select=eq(pict_type\\,I)"  # select only I-frames
+                frame_limit = []
             ffmpeg_tail = [
                 "-vf",  # video filter
-                "select=eq(pict_type\\,I)",  # select only I-frames
+                frame_filter,
+                *frame_limit,
                 "-vsync",
                 "0",  # disable v-sync to avoid frame duplication
                 "-q:v",  # quality level for JPEG (lower is better)
@@ -655,7 +769,6 @@ class MediaProcessor:
                 "-",
             ]
             ffmpeg_stderr = None
-            temp_file_path = None
 
             # If file is served over http(s)
             if video_path.startswith("http://") or video_path.startswith("https://"):
@@ -788,6 +901,11 @@ class MediaProcessor:
                         try:
                             img = Image.open(io.BytesIO(jpeg_data))
                             await self.hass.loop.run_in_executor(None, img.load)
+                            if constant_fps:
+                                # Every frame is kept, so none are scored
+                                frames.append((jpeg_data, None, frame_counter))
+                                frame_counter += 1
+                                continue
                             if img.mode == "RGBA":
                                 img = img.convert("RGB")
                             current_frame_gray = np.array(img.convert("L"))
@@ -813,8 +931,7 @@ class MediaProcessor:
                                 f"Cannot identify image from ffmpeg pipe at frame {frame_counter}"
                             )
                             continue
-                        if frame_counter >= max_frames:
-                            break
+                        # Variable mode scores every frame; max_frames applies at selection
                 await ffmpeg_process.wait()
 
                 if (
@@ -837,13 +954,6 @@ class MediaProcessor:
                 f"FFmpeg process finished with return code {ffmpeg_process.returncode}"
             )
 
-            # Cleanup temp file (if any)
-            if temp_file_path and os.path.exists(temp_file_path):
-                try:
-                    os.remove(temp_file_path)
-                except Exception:
-                    pass
-
             if ffmpeg_process.returncode != 0:
                 msg = f"FFmpeg failed with return code {ffmpeg_process.returncode}"
                 if ffmpeg_stderr:
@@ -859,26 +969,32 @@ class MediaProcessor:
             if len(frames) == 0 and first_frame is None:
                 raise ServiceValidationError("No frames extracted from video.")
 
-            # Log all frames with scores
-            for fdata, fscore, findex in frames:
-                _LOGGER.debug(f"Extracted frame {findex} with SSIM score {fscore:.6f}")
+            if constant_fps:
+                # Already evenly spaced, in order, and capped by ffmpeg
+                selected_frames = frames[: max(0, max_frames)]
+            else:
+                # Log all frames with scores
+                for fdata, fscore, findex in frames:
+                    _LOGGER.debug(
+                        f"Extracted frame {findex} with SSIM score {fscore:.6f}"
+                    )
 
-            # Sort scored frames by SSIM
-            frames.sort(key=lambda x: x[1])
+                # Sort scored frames by SSIM
+                frames.sort(key=lambda x: x[1])
 
-            # Frame selection: prepend first frame, then best-scored (respect max_frames)
-            selected_frames = []
-            remaining = max(0, max_frames)
+                # Frame selection: prepend first frame, then best-scored (respect max_frames)
+                selected_frames = []
+                remaining = max(0, max_frames)
 
-            if first_frame is not None and remaining > 0:
-                first_data, first_idx = first_frame
-                selected_frames.append((first_data, None, first_idx))
-                remaining -= 1
+                if first_frame is not None and remaining > 0:
+                    first_data, first_idx = first_frame
+                    selected_frames.append((first_data, None, first_idx))
+                    remaining -= 1
 
-            best_rest = frames[:remaining]
-            # Keep chronological order for the rest
-            best_rest.sort(key=lambda x: x[2])
-            selected_frames.extend(best_rest)
+                best_rest = frames[:remaining]
+                # Keep chronological order for the rest
+                best_rest.sort(key=lambda x: x[2])
+                selected_frames.extend(best_rest)
 
             # Add frames to client
             resized_base64 = []
@@ -910,8 +1026,40 @@ class MediaProcessor:
                     image_data=resized_base64[key_idx],
                     uid=str(uuid.uuid4())[:8],
                 )
+
+            if encode_video and constant_fps and selected_frames:
+                # Encode the ffmpeg-scaled JPEGs, not the resized base64 copies
+                video_bytes = await self._encode_video(
+                    jpeg_frames=[frame_data for frame_data, _, _ in selected_frames],
+                    fps=fps,
+                )
+                if video_bytes:
+                    base64_video = base64.b64encode(video_bytes).decode("utf-8")
+                    if len(base64_video) > MAX_INLINE_VIDEO_BYTES:
+                        _LOGGER.warning(
+                            f"Encoded video is {len(base64_video) / 1_048_576:.1f} MB "
+                            f"after base64, over the {MAX_INLINE_VIDEO_BYTES / 1_048_576:.0f} MB "
+                            "inline limit; sending images instead"
+                        )
+                    else:
+                        self.client.add_video_clip(
+                            base64_video=base64_video,
+                            filename=(
+                                os.path.splitext(os.path.basename(video_path))[0]
+                                if include_filename
+                                else ""
+                            ),
+                            fps=fps,
+                        )
         except Exception as e:
             raise ServiceValidationError(f"Error processing video {video_path}: {e}")
+        finally:
+            # Remove the downloaded copy of a remote video (if any)
+            if temp_file_path and os.path.exists(temp_file_path):
+                try:
+                    os.remove(temp_file_path)
+                except Exception:
+                    pass
 
     async def add_videos(
         self,
@@ -921,6 +1069,9 @@ class MediaProcessor:
         target_width,
         include_filename,
         expose_images,
+        fps_mode=FPS_MODE_VARIABLE,
+        fps=1,
+        encode_video=False,
     ):
         """Wrapper for client.add_frame for videos"""
 
@@ -945,6 +1096,9 @@ class MediaProcessor:
                 target_width=target_width,
                 include_filename=include_filename,
                 expose_images=expose_images,
+                fps_mode=fps_mode,
+                fps=fps,
+                encode_video=encode_video,
             )
 
         # Process videos in parallel

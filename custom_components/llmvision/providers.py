@@ -80,6 +80,8 @@ class Request:
         self.temperature = temperature
         self.base64_images = []
         self.filenames = []
+        # Frames encoded as video, for providers that take video natively
+        self.videos = []
 
     @staticmethod
     def sanitize_data(data):
@@ -175,6 +177,7 @@ class Request:
         call.top_p = config.get(CONF_TOP_P, 0.9)
         call.base64_images = self.base64_images
         call.filenames = self.filenames
+        call.videos = self.videos
 
         self.validate(call)
 
@@ -305,6 +308,21 @@ class Request:
     def add_frame(self, base64_image, filename):
         self.base64_images.append(base64_image)
         self.filenames.append(filename)
+
+    def add_video_clip(self, base64_video, filename, fps, mime_type="video/mp4"):
+        """Attach a video for providers that accept video natively.
+
+        Frames added with add_frame are still required: providers without
+        video support, and fallback providers, use them instead.
+        """
+        self.videos.append(
+            {
+                "data": base64_video,
+                "filename": filename,
+                "fps": fps,
+                "mime_type": mime_type,
+            }
+        )
 
     def heal_json(self, text):
         """Attempt to heal malformed JSON for common LLM output issues."""
@@ -458,6 +476,11 @@ class Provider(ABC):
 
     def supports_structured_output(self) -> bool:
         """Return True if provider supports structured output."""
+        return False
+
+    @classmethod
+    def supports_video_input(cls, model: str) -> bool:
+        """Return True if the model accepts a video file instead of frames."""
         return False
 
     def _get_default_parameters(self, call: Any) -> dict:
@@ -1290,6 +1313,11 @@ class Google(Provider):
     def _model_supports_thinking(self) -> bool:
         return any(m in self.model for m in ["gemini-2.5", "gemini-3"])
 
+    @classmethod
+    def supports_video_input(cls, model: str) -> bool:
+        # Gemini models take video; Gemma models on the same API do not
+        return "gemini" in (model or "").lower()
+
     def _generate_headers(self) -> dict:
         return {"content-type": "application/json"}
 
@@ -1353,16 +1381,33 @@ class Google(Provider):
                 raise ServiceValidationError(
                     f"Invalid JSON in structure parameter: {str(e)}"
                 )
-        for image, filename in zip(call.base64_images, call.filenames):
-            tag = (
-                ("Image " + str(call.base64_images.index(image) + 1))
-                if filename == ""
-                else filename
-            )
-            payload["contents"][0]["parts"].append({"text": tag + ":"})
-            payload["contents"][0]["parts"].append(
-                {"inline_data": {"mime_type": "image/jpeg", "data": image}}
-            )
+        videos = getattr(call, "videos", None) or []
+        if videos and self.supports_video_input(self.model):
+            # Send the clip itself; the extracted frames would only duplicate it
+            for index, video in enumerate(videos, start=1):
+                tag = video.get("filename") or f"Video {index}"
+                video_part = {
+                    "inline_data": {
+                        "mime_type": video["mime_type"],
+                        "data": video["data"],
+                    }
+                }
+                # Gemini samples video at 1 fps unless told otherwise
+                if video.get("fps") and video["fps"] != 1:
+                    video_part["video_metadata"] = {"fps": video["fps"]}
+                payload["contents"][0]["parts"].append({"text": tag + ":"})
+                payload["contents"][0]["parts"].append(video_part)
+        else:
+            for image, filename in zip(call.base64_images, call.filenames):
+                tag = (
+                    ("Image " + str(call.base64_images.index(image) + 1))
+                    if filename == ""
+                    else filename
+                )
+                payload["contents"][0]["parts"].append({"text": tag + ":"})
+                payload["contents"][0]["parts"].append(
+                    {"inline_data": {"mime_type": "image/jpeg", "data": image}}
+                )
         # User message
         payload["contents"][0]["parts"].append({"text": call.message})
         # System prompt
@@ -2177,6 +2222,15 @@ class ProviderFactory:
     """
     Factory to create provider instances from a provider name and config
     """
+
+    @staticmethod
+    def supports_video_input(provider_name: str | None, model: str | None) -> bool:
+        """Whether a provider and model take a video file instead of frames.
+
+        Checked before media is processed, so that a clip is only encoded when
+        it will be sent. Only Gemini on the Google provider does today.
+        """
+        return provider_name == "Google" and Google.supports_video_input(model or "")
 
     @staticmethod
     def create(

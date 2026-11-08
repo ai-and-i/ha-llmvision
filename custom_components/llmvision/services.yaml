@@ -210,17 +210,51 @@ video_analyzer:
       selector:
         text:
           multiline: true
+    fps_mode:
+      name: FPS Mode
+      required: false
+      description: >-
+        How frames are taken from the video. Variable: the Max Frames frames
+        with the most change, chosen from the video's keyframes. Constant: one
+        frame every 1/FPS seconds from the start, up to Max Frames; the rest of
+        the video is dropped. In constant mode, providers that accept video
+        (Google Gemini) get those frames as a video; others get them as images.
+      default: variable
+      example: constant
+      selector:
+        select:
+          options:
+            - label: Variable (frames with the most change)
+              value: variable
+            - label: Constant (fixed frame rate)
+              value: constant
     max_frames:
       name: Max Frames
-      description: How many frames to analyze. Picks frames with the most movement.
+      description: >-
+        How many frames to analyze. In variable mode, picks the frames with the
+        most change. In constant mode, limits how much of the video is used:
+        Max Frames ÷ FPS seconds from the start.
       required: false
       example: 3
       default: 3
       selector:
         number:
           min: 1
-          max: 10
+          max: 300
           step: 1
+          mode: box
+    fps:
+      name: FPS
+      required: false
+      description: Frames per second to take in constant mode. Ignored in variable mode.
+      example: 1
+      default: 1
+      selector:
+        number:
+          min: 0.1
+          max: 10
+          step: 0.1
+          mode: box
     include_filename:
       name: Include Filename
       required: true
