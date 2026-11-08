@@ -25,6 +25,14 @@ image_analyzer:
       selector:
         text:
           multiline: true
+    system_prompt:
+      name: System Prompt
+      required: false
+      description: 'System prompt for this call. Replaces the system prompt from LLM Vision Settings. Leave unchecked to use the Settings prompt.'
+      example: "Describe only people and vehicles. Ignore animals, weather and lighting."
+      selector:
+        text:
+          multiline: true
     store_in_timeline:
       name: Store in Timeline
       required: false
@@ -159,6 +167,14 @@ video_analyzer:
       required: true
       description: 'Model prompt'
       example: "Describe what happens in the video"
+      selector:
+        text:
+          multiline: true
+    system_prompt:
+      name: System Prompt
+      required: false
+      description: 'System prompt for this call. Replaces the system prompt from LLM Vision Settings. Leave unchecked to use the Settings prompt.'
+      example: "Describe only people and vehicles. Ignore animals, weather and lighting."
       selector:
         text:
           multiline: true
@@ -306,6 +322,14 @@ stream_analyzer:
       required: true
       description: 'Model prompt'
       example: "Describe what happens in the camera feed"
+      selector:
+        text:
+          multiline: true
+    system_prompt:
+      name: System Prompt
+      required: false
+      description: 'System prompt for this call. Replaces the system prompt from LLM Vision Settings. Leave unchecked to use the Settings prompt.'
+      example: "Describe only people and vehicles. Ignore animals, weather and lighting."
       selector:
         text:
           multiline: true
@@ -457,6 +481,14 @@ data_analyzer:
       description: 'Describe what should be extracted from the image. Data types and available options will be recognized automatically based the provided sensor.'
       example: "How many cars are parked?"
       default: "How many cars are parked?"
+      selector:
+        text:
+          multiline: true
+    system_prompt:
+      name: System Prompt
+      required: false
+      description: 'System prompt for this call. Replaces the built-in data extraction prompt. Leave unchecked to use the built-in prompt.'
+      example: "Count only cars that are fully inside the parking spaces. Answer with a number only."
       selector:
         text:
           multiline: true

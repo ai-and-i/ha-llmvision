@@ -40,6 +40,7 @@ from .const import (
     CONF_AWS_SECRET_ACCESS_KEY,
     CONF_AWS_REGION_NAME,
     MESSAGE,
+    SYSTEM_PROMPT,
     STORE_IN_TIMELINE,
     USE_MEMORY,
     MODEL,
@@ -485,7 +486,9 @@ class ServiceCallData:
         self.description_field: str = data_call.data.get(DESCRIPTION_FIELD, "")
         self.memory: Memory | None = None
         # Overrides the Settings system prompt for this call when set
-        self.system_prompt: str | None = None
+        self.system_prompt: str | None = (
+            str(data_call.data.get(SYSTEM_PROMPT) or "").strip() or None
+        )
 
         # ------------ Create Event ------------
         self.title: str = data_call.data.get("title")
@@ -858,7 +861,8 @@ def setup(hass, config):
             expose_images=call.expose_images,
         )
 
-        call.system_prompt = DATA_EXTRACTION_PROMPT.format(data_format=data_type)
+        if not call.system_prompt:
+            call.system_prompt = DATA_EXTRACTION_PROMPT.format(data_format=data_type)
         call.memory = Memory(hass)
         await call.memory._update_memory()
 

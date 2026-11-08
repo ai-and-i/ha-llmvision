@@ -55,6 +55,7 @@ SIGNAL_TIMELINE_UPDATED = f"{DOMAIN}_timeline_updated"
 
 # SERVICE CALL CONSTANTS
 MESSAGE = "message"
+SYSTEM_PROMPT = "system_prompt"
 STORE_IN_TIMELINE = "store_in_timeline"
 USE_MEMORY = "use_memory"
 PROVIDER = "provider"

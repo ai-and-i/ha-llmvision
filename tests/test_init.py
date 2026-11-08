@@ -26,6 +26,7 @@ from custom_components.llmvision.const import (
     CONF_DEFAULT_MODEL,
     CONF_PROVIDER,
     CONF_RETENTION_TIME,
+    DATA_EXTRACTION_PROMPT,
     DOMAIN,
 )
 
@@ -141,6 +142,26 @@ class TestServiceCallData:
         assert call.image_paths == ["a.jpg", "b.jpg"]
         assert call.video_paths == ["a.mp4", "b.mp4"]
         assert call.event_id == ["id1", "id2"]
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            ("Only report people.", "Only report people."),
+            ("  Only report people.\n", "Only report people."),
+            ("", None),
+            ("   ", None),
+            (None, None),
+        ],
+    )
+    def test_system_prompt_from_service_data(self, value, expected):
+        call = ServiceCallData(
+            _build_data_call(_base_service_data(system_prompt=value))
+        )
+        assert call.system_prompt == expected
+
+    def test_system_prompt_defaults_to_none_when_omitted(self):
+        call = ServiceCallData(_build_data_call(_base_service_data()))
+        assert call.system_prompt is None
 
     @pytest.mark.parametrize(
         "value", [1704110400, 1704110400.0, "1704110400", "2024-01-01T12:00:00"]
@@ -590,6 +611,10 @@ class TestSetupServices:
                     _base_service_data(sensor_entity="input_boolean.kitchen")
                 )
             )
+            # With no system prompt in the call, the built-in extraction prompt is used
+            assert call_obj.system_prompt == DATA_EXTRACTION_PROMPT.format(
+                data_format="one of: ['on', 'off']"
+            )
 
             request_obj.call.return_value = {"response_text": "2.0"}
             hass.states.get.return_value = SimpleNamespace(
@@ -616,12 +641,38 @@ class TestSetupServices:
             )
 
         assert update_sensor_mock.await_count == 4
-        # The extraction prompt is passed to providers as the call's system prompt
-        from custom_components.llmvision.const import DATA_EXTRACTION_PROMPT
 
-        assert call_obj.system_prompt == DATA_EXTRACTION_PROMPT.format(
-            data_format="text (string)"
+    @pytest.mark.anyio
+    async def test_data_analyzer_keeps_system_prompt_from_call(self):
+        hass = _make_hass()
+        assert setup(hass, {}) is True
+        data_handler = self._registered_handlers(hass)["data_analyzer"]
+
+        request_obj = Mock()
+        request_obj.call = AsyncMock(return_value={"response_text": "3"})
+        memory_obj = Mock()
+        memory_obj._update_memory = AsyncMock()
+        processor = Mock()
+        processor.key_frame = ""
+        processor.add_visual_data = AsyncMock(return_value=request_obj)
+        service_data = _base_service_data(
+            sensor_entity="sensor.cars", system_prompt="Count parked cars only."
         )
+        call_obj = ServiceCallData(_build_data_call(service_data))
+
+        with (
+            patch("custom_components.llmvision.ServiceCallData", return_value=call_obj),
+            patch("custom_components.llmvision.Request", return_value=request_obj),
+            patch("custom_components.llmvision.MediaProcessor", return_value=processor),
+            patch("custom_components.llmvision.Memory", return_value=memory_obj),
+            patch("custom_components.llmvision._create_event", new=AsyncMock()),
+            patch("custom_components.llmvision._update_sensor", new=AsyncMock()),
+        ):
+            hass.states.get.return_value = SimpleNamespace(state="1", attributes={})
+            await data_handler(_build_data_call(service_data))
+
+        assert call_obj.system_prompt == "Count parked cars only."
+        request_obj.call.assert_awaited_once_with(call_obj)
 
     @pytest.mark.anyio
     async def test_data_analyzer_unsupported_and_unavailable_raise(self):
