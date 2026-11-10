@@ -77,6 +77,14 @@ FPS_MODE_VARIABLE = "variable"  # max_frames frames with the most change
 FPS_MODE_CONSTANT = "constant"  # one frame every 1/fps seconds, up to max_frames
 SAVE_CLIP = "save_clip"
 CLIP_PATH = "clip_path"
+# Google Gemini only: generationConfig.mediaResolution, applied to every
+# image and video part. Not set means Gemini's default.
+MEDIA_RESOLUTION = "media_resolution"
+MEDIA_RESOLUTIONS = {
+    "low": "MEDIA_RESOLUTION_LOW",
+    "medium": "MEDIA_RESOLUTION_MEDIUM",
+    "high": "MEDIA_RESOLUTION_HIGH",
+}
 
 # Where video_analyzer keeps source clips for timeline events
 CLIPS_DIR = f"/media/{DOMAIN}/clips"

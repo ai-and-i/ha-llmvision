@@ -3188,5 +3188,225 @@ async def test_post_reports_exception_type(coverage_hass):
         await provider._post("https://example.com", {}, {})
 
 
+@pytest.mark.parametrize("videos", [[], [_video()]])
+def test_google_leaves_out_media_resolution_when_not_set(coverage_hass, videos):
+    google = Google(coverage_hass, "k", "gemini-2.5-flash")
+
+    for call_obj in (
+        make_coverage_call(videos=videos),
+        make_coverage_call(videos=videos, media_resolution=None),
+    ):
+        payload = google._prepare_vision_data(call_obj)
+        assert set(payload["generationConfig"]) == {
+            "maxOutputTokens",
+            "temperature",
+            "topP",
+        }
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("low", "MEDIA_RESOLUTION_LOW"),
+        ("medium", "MEDIA_RESOLUTION_MEDIUM"),
+        ("high", "MEDIA_RESOLUTION_HIGH"),
+    ],
+)
+@pytest.mark.parametrize("videos", [[], [_video()]])
+def test_google_sends_media_resolution(coverage_hass, value, expected, videos):
+    google = Google(coverage_hass, "k", "gemini-2.5-flash")
+
+    payload = google._prepare_vision_data(
+        make_coverage_call(videos=videos, media_resolution=value)
+    )
+
+    assert payload["generationConfig"]["mediaResolution"] == expected
+
+
+@pytest.mark.anyio
+async def test_google_sends_media_resolution_with_uploaded_video(large_video_google):
+    google = large_video_google
+    google.session = _FakeFilesSession(posts=_upload_replies())
+
+    await google.vision_request(
+        make_coverage_call(videos=[_video(data=b"x" * 30)], media_resolution="high")
+    )
+
+    payload = google._make_request.await_args.args[0]
+    assert "file_data" in payload["contents"][0]["parts"][1]
+    assert payload["generationConfig"]["mediaResolution"] == "MEDIA_RESOLUTION_HIGH"
+
+
+def test_google_title_request_has_no_media_resolution(coverage_hass):
+    google = Google(coverage_hass, "k", "gemini-2.5-flash")
+
+    payload = google._prepare_text_data(make_coverage_call(media_resolution="high"))
+
+    assert "mediaResolution" not in payload["generationConfig"]
+
+
+def test_other_providers_ignore_media_resolution(coverage_hass):
+    openai = OpenAI(coverage_hass, "k", "gpt-4o")
+
+    payload = openai._prepare_vision_data(make_coverage_call(media_resolution="high"))
+
+    assert "MEDIA_RESOLUTION" not in json.dumps(payload)
+    assert "mediaResolution" not in json.dumps(payload)
+
+
+GOOGLE_USAGE_METADATA = {
+    "promptTokenCount": 13145,
+    "candidatesTokenCount": 120,
+    "thoughtsTokenCount": 300,
+    "totalTokenCount": 13565,
+    "promptTokensDetails": [
+        {"modality": "TEXT", "tokenCount": 800},
+        {"modality": "VIDEO", "tokenCount": 12345},
+    ],
+}
+
+
+@pytest.mark.anyio
+async def test_google_make_request_reads_usage(coverage_hass):
+    google = Google(coverage_hass, "k", "gemini-2.5-flash")
+    google._post = AsyncMock(
+        return_value={
+            **make_google_generate_content_response(),
+            "usageMetadata": GOOGLE_USAGE_METADATA,
+        }
+    )
+
+    assert await google._make_request({}) == "ok"
+
+    assert google.last_usage == {
+        "prompt_tokens": 13145,
+        "output_tokens": 120,
+        "thinking_tokens": 300,
+        "total_tokens": 13565,
+        "prompt_tokens_by_modality": {"TEXT": 800, "VIDEO": 12345},
+    }
+
+
+@pytest.mark.anyio
+async def test_google_make_request_fills_in_counts_gemini_leaves_out(coverage_hass):
+    google = Google(coverage_hass, "k", "gemini-2.0-flash")
+    google._post = AsyncMock(
+        return_value={
+            **make_google_generate_content_response(),
+            "usageMetadata": {"promptTokenCount": 300, "candidatesTokenCount": 5},
+        }
+    )
+
+    await google._make_request({})
+
+    assert google.last_usage == {
+        "prompt_tokens": 300,
+        "output_tokens": 5,
+        "thinking_tokens": 0,
+        "total_tokens": 305,
+        "prompt_tokens_by_modality": {},
+    }
+
+
+@pytest.mark.anyio
+async def test_google_make_request_without_usage_metadata(coverage_hass):
+    google = Google(coverage_hass, "k", "gemini-2.5-flash")
+    google.last_usage = {"prompt_tokens": 1}
+    google._post = AsyncMock(return_value=make_google_generate_content_response())
+
+    await google._make_request({})
+
+    assert google.last_usage is None
+
+
+def _google_request(coverage_hass, monkeypatch, replies):
+    """Request whose provider is Gemini, answering with replies in order."""
+    google = Google(coverage_hass, "k", "gemini-2.5-flash")
+    google._post = AsyncMock(side_effect=replies)
+    monkeypatch.setattr(ProviderFactory, "create", lambda **kwargs: google)
+    req = Request(coverage_hass, "m", 10, 0.2)
+    req.base64_images = ["aW1n"]
+    req.filenames = ["f.jpg"]
+    return req
+
+
+@pytest.mark.anyio
+async def test_request_call_returns_vision_usage_not_title_usage(
+    monkeypatch, coverage_hass
+):
+    title_reply = {
+        **make_google_generate_content_response("Door"),
+        "usageMetadata": {"promptTokenCount": 40, "candidatesTokenCount": 2},
+    }
+    req = _google_request(
+        coverage_hass,
+        monkeypatch,
+        [
+            {
+                **make_google_generate_content_response("A cat"),
+                "usageMetadata": GOOGLE_USAGE_METADATA,
+            },
+            title_reply,
+        ],
+    )
+
+    result = await req.call(make_coverage_call(generate_title=True))
+
+    assert result["response_text"] == "A cat"
+    assert result["title"] == "Door"
+    assert result["usage"]["prompt_tokens"] == 13145
+    assert result["usage"]["prompt_tokens_by_modality"]["VIDEO"] == 12345
+
+
+@pytest.mark.anyio
+async def test_request_call_has_no_usage_when_not_reported(monkeypatch, coverage_hass):
+    req = _google_request(
+        coverage_hass, monkeypatch, [make_google_generate_content_response("A cat")]
+    )
+
+    result = await req.call(make_coverage_call())
+
+    assert result == {"response_text": "A cat"}
+
+
+@pytest.mark.anyio
+async def test_request_call_has_no_usage_for_providers_without_it(
+    monkeypatch, coverage_hass
+):
+    monkeypatch.setattr(
+        ProviderFactory, "create", lambda **kwargs: DummyProvider(supports=False)
+    )
+    req = Request(coverage_hass, "m", 10, 0.2)
+    req.base64_images = ["aW1n"]
+    req.filenames = ["f.jpg"]
+
+    result = await req.call(make_coverage_call())
+
+    assert "usage" not in result
+
+
+@pytest.mark.anyio
+async def test_request_call_glimpse_response_includes_usage(monkeypatch, coverage_hass):
+    req = _google_request(
+        coverage_hass,
+        monkeypatch,
+        [
+            {
+                **make_google_generate_content_response(
+                    '{"title": "Cat", "description": "A cat on the porch"}'
+                ),
+                "usageMetadata": GOOGLE_USAGE_METADATA,
+            }
+        ],
+    )
+    call_obj = make_coverage_call()
+    call_obj.model_is_glimpse = lambda: True
+
+    result = await req.call(call_obj)
+
+    assert result["response_text"] == "A cat on the porch"
+    assert result["usage"]["total_tokens"] == 13565
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

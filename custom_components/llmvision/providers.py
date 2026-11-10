@@ -70,6 +70,7 @@ from .const import (
     DEFAULT_TITLE_PROMPT,
     GLIMPSE_V1_INSTRUCTIONS,
     MAX_INLINE_VIDEO_BYTES,
+    MEDIA_RESOLUTIONS,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -214,6 +215,8 @@ class Request:
         try:
             # Make call to provider
             response_text = await provider_instance.vision_request(call)
+            # Read now: a title request on the same provider replaces it
+            usage = getattr(provider_instance, "last_usage", None)
         except Exception as e:
             _LOGGER.error(f"Provider {provider_name} failed: {e}")
             # Try fallback if configured and not already tried
@@ -249,6 +252,8 @@ class Request:
                             )
                         if desc_val is not None:
                             result["response_text"] = str(desc_val)
+                        if usage:
+                            result["usage"] = usage
                         return result
                 except Exception as e:
                     _LOGGER.debug(f"Ollama Glimpse JSON parse failed: {e}")
@@ -308,6 +313,8 @@ class Request:
         else:
             result["response_text"] = response_text
 
+        if usage:
+            result["usage"] = usage
         return result
 
     def add_frame(self, base64_image, filename):
@@ -464,6 +471,8 @@ class Provider(ABC):
         self.model = model
         self.endpoint = endpoint
         self.request_timeout = self._resolve_request_timeout()
+        # Token usage of the last request, for providers that report it
+        self.last_usage: dict | None = None
         _LOGGER.debug(
             f"Provider initialized: {self.__class__.__name__.title()}(model={self.model}, endpoint={self.endpoint})"
         )
@@ -1345,7 +1354,17 @@ class Google(Provider):
                 model=self.model, api_key=self.api_key
             )
             headers = self._generate_headers()
+            self.last_usage = None
             response = await self._post(url=endpoint, headers=headers, data=data)
+            self.last_usage = self._parse_usage(response)
+            if self.last_usage:
+                _LOGGER.debug(
+                    f"Gemini usage: prompt={self.last_usage['prompt_tokens']} "
+                    f"(by modality: {self.last_usage['prompt_tokens_by_modality']}), "
+                    f"output={self.last_usage['output_tokens']}, "
+                    f"thinking={self.last_usage['thinking_tokens']}, "
+                    f"total={self.last_usage['total_tokens']}"
+                )
             candidates = response.get("candidates")
             if not candidates or not isinstance(candidates, list) or not candidates[0]:
                 raise ServiceValidationError(
@@ -1361,6 +1380,33 @@ class Google(Provider):
             _LOGGER.error(f"Error: {e}")
             raise e
         return response_text
+
+    @staticmethod
+    def _parse_usage(response: dict) -> dict | None:
+        """Token counts from usageMetadata, or None if the response has none."""
+        metadata = response.get("usageMetadata")
+        if not isinstance(metadata, dict) or not metadata:
+            return None
+        by_modality: dict[str, int] = {}
+        for detail in metadata.get("promptTokensDetails") or []:
+            modality = detail.get("modality")
+            if modality:
+                by_modality[modality] = by_modality.get(modality, 0) + int(
+                    detail.get("tokenCount", 0)
+                )
+        # Gemini leaves out counts that are zero, e.g. thoughts without thinking
+        prompt = int(metadata.get("promptTokenCount", 0))
+        output = int(metadata.get("candidatesTokenCount", 0))
+        thinking = int(metadata.get("thoughtsTokenCount", 0))
+        return {
+            "prompt_tokens": prompt,
+            "output_tokens": output,
+            "thinking_tokens": thinking,
+            "total_tokens": int(
+                metadata.get("totalTokenCount", prompt + output + thinking)
+            ),
+            "prompt_tokens_by_modality": by_modality,
+        }
 
     async def vision_request(self, call: Any) -> str:
         # Videos too large to send inline are uploaded first, then deleted
@@ -1530,6 +1576,13 @@ class Google(Provider):
             payload["generationConfig"]["thinkingConfig"] = {
                 "thinkingBudget": default_parameters.get("thinking_budget", 0)
             }
+
+        # Applies to every image and video part; left out, Gemini uses its default
+        media_resolution = getattr(call, "media_resolution", None)
+        if media_resolution:
+            payload["generationConfig"]["mediaResolution"] = MEDIA_RESOLUTIONS[
+                media_resolution
+            ]
 
         # Add structured output support
         if call.response_format == "json" and call.structure:

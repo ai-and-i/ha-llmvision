@@ -84,6 +84,23 @@ image_analyzer:
         number:
           min: 512
           max: 1920
+    media_resolution:
+      name: Media Resolution
+      required: false
+      description: >-
+        Google Gemini only: how much detail Gemini uses for each image or video
+        frame. Higher values cost more input tokens. Leave empty for Gemini's
+        default.
+      example: high
+      selector:
+        select:
+          options:
+            - label: Low
+              value: low
+            - label: Medium
+              value: medium
+            - label: High
+              value: high
     max_tokens:
       name: Maximum Tokens
       description: 'Maximum number of tokens to generate'
@@ -273,6 +290,23 @@ video_analyzer:
         number:
           min: 512
           max: 1920
+    media_resolution:
+      name: Media Resolution
+      required: false
+      description: >-
+        Google Gemini only: how much detail Gemini uses for each image or video
+        frame. Higher values cost more input tokens. Leave empty for Gemini's
+        default.
+      example: high
+      selector:
+        select:
+          options:
+            - label: Low
+              value: low
+            - label: Medium
+              value: medium
+            - label: High
+              value: high
     max_tokens:
       name: Maximum Tokens
       description: 'Maximum number of tokens to generate'
@@ -445,6 +479,23 @@ stream_analyzer:
         number:
           min: 512
           max: 1920
+    media_resolution:
+      name: Media Resolution
+      required: false
+      description: >-
+        Google Gemini only: how much detail Gemini uses for each image or video
+        frame. Higher values cost more input tokens. Leave empty for Gemini's
+        default.
+      example: high
+      selector:
+        select:
+          options:
+            - label: Low
+              value: low
+            - label: Medium
+              value: medium
+            - label: High
+              value: high
     max_tokens:
       name: Maximum Tokens
       description: 'Maximum number of tokens to generate'
@@ -600,6 +651,23 @@ data_analyzer:
         number:
           min: 512
           max: 1920
+    media_resolution:
+      name: Media Resolution
+      required: false
+      description: >-
+        Google Gemini only: how much detail Gemini uses for each image or video
+        frame. Higher values cost more input tokens. Leave empty for Gemini's
+        default.
+      example: high
+      selector:
+        select:
+          options:
+            - label: Low
+              value: low
+            - label: Medium
+              value: medium
+            - label: High
+              value: high
     max_tokens:
       name: Maximum Tokens
       description: 'Maximum number of tokens to generate'

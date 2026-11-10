@@ -41,6 +41,7 @@
 - Remembers people, pets and objects
 - Keeps a timeline of camera events, so you can display them on your dashboard or ask Assist about them.
 - Seamlessly updates sensors based on data extracted from camera streams, images or videos
+- `media_resolution` (`low`, `medium`, `high`) on the analyzer actions sets how much detail Google Gemini uses for each image or video frame. It only works with Gemini; other providers ignore it. `high` uses roughly 4× the video tokens of the default (about 280 instead of 70 per frame on Gemini 3 and later). Image token counts vary by model. The response's `usage` shows the tokens a call used.
 
 <br>
 

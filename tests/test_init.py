@@ -193,6 +193,37 @@ class TestServiceCallData:
         with pytest.raises(ServiceValidationError, match="fps_mode must be"):
             ServiceCallData(_build_data_call(_base_service_data(fps_mode="fast")))
 
+    def test_media_resolution_not_set_by_default(self):
+        call = ServiceCallData(_build_data_call(_base_service_data()))
+        assert call.media_resolution is None
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            ("low", "low"),
+            ("medium", "medium"),
+            ("high", "high"),
+            ("High", "high"),
+            (" MEDIUM ", "medium"),
+            ("", None),
+            (None, None),
+        ],
+    )
+    def test_media_resolution_from_service_data(self, value, expected):
+        call = ServiceCallData(
+            _build_data_call(_base_service_data(media_resolution=value))
+        )
+        assert call.media_resolution == expected
+
+    def test_unknown_media_resolution_raises(self):
+        with pytest.raises(ServiceValidationError) as err:
+            ServiceCallData(
+                _build_data_call(_base_service_data(media_resolution="ultra"))
+            )
+        assert str(err.value) == (
+            "media_resolution must be 'low', 'medium' or 'high', got 'ultra'"
+        )
+
     @pytest.mark.parametrize(
         "value", [1704110400, 1704110400.0, "1704110400", "2024-01-01T12:00:00"]
     )

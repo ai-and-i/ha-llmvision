@@ -58,6 +58,8 @@ from .const import (
     FPS_MODE,
     FPS_MODE_CONSTANT,
     FPS_MODE_VARIABLE,
+    MEDIA_RESOLUTION,
+    MEDIA_RESOLUTIONS,
     SAVE_CLIP,
     CLIP_PATH,
     INCLUDE_FILENAME,
@@ -490,6 +492,14 @@ class ServiceCallData:
         self.fps: float = 1.0 if fps is None else float(fps)
         if self.fps_mode == FPS_MODE_CONSTANT and self.fps <= 0:
             raise ServiceValidationError(f"fps must be greater than 0, got {fps}")
+        # Google Gemini only; None leaves mediaResolution out of the request
+        media_resolution = str(data_call.data.get(MEDIA_RESOLUTION) or "").strip()
+        self.media_resolution: str | None = media_resolution.lower() or None
+        if self.media_resolution and self.media_resolution not in MEDIA_RESOLUTIONS:
+            raise ServiceValidationError(
+                "media_resolution must be 'low', 'medium' or 'high', "
+                f"got '{media_resolution}'"
+            )
         self.target_width: int = data_call.data.get(TARGET_WIDTH, 3840)
         self.temperature: float = float()
         self.max_tokens: int = int(data_call.data.get(MAXTOKENS, 3000))
