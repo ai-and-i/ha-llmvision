@@ -143,6 +143,7 @@ class TimelineEventCreateView(HomeAssistantView):
         label = data.get("label") or ""
         category = data.get("category")
         labels = data.get("labels")
+        details = data.get("details")
 
         # Times: accept ISO strings or timestamps; default to now..now+1min
         def _parse_time(val):
@@ -178,6 +179,7 @@ class TimelineEventCreateView(HomeAssistantView):
                 label=label,
                 category=category,
                 labels=labels,
+                details=details,
             )
         except ServiceValidationError as e:
             return self.json_message(str(e), status_code=400)
@@ -303,6 +305,8 @@ class TimelineEventView(HomeAssistantView):
                 label=data.get("label"),
                 category=data.get("category"),
                 labels=data.get("labels"),
+                # Left out keeps the event's details
+                details=data["details"] if "details" in data else ...,
             )
         except ServiceValidationError as e:
             return self.json_message(str(e), status_code=400)

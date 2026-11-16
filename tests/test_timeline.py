@@ -25,6 +25,7 @@ from custom_components.llmvision.timeline import (
     Event,
     Timeline,
     _get_category_and_label,
+    normalize_details,
     normalize_labels,
     validate_clip_path,
 )
@@ -2033,7 +2034,7 @@ class TestLabelsMigration:
 
         tl._migrate_to_v5.assert_not_awaited()
         assert await tl._has_latest_schema()
-        assert await tl._get_db_version() == DB_VERSION == 6
+        assert await tl._get_db_version() == DB_VERSION == 7
         async with aiosqlite.connect(tl._db_path) as db:
             async with db.execute("SELECT uid, labels FROM events") as cursor:
                 stored = dict(await cursor.fetchall())
@@ -2057,3 +2058,100 @@ class TestLabelsMigration:
 
         event = (await tl.get_events_json(limit=None))[0]
         assert event["labels"] == ["squirrel", "bird feeder"]
+
+
+# ---------------------------------------------------------------------------
+# Details
+# ---------------------------------------------------------------------------
+
+
+class TestNormalizeDetails:
+    def test_empty_values_mean_none(self):
+        for value in (None, "", "  ", {}, []):
+            assert normalize_details(value) is None
+
+    def test_json_text_is_parsed(self):
+        assert normalize_details('{"a": [1, 2]}') == {"a": [1, 2]}
+        assert normalize_details("[1, 2]") == [1, 2]
+
+    def test_plain_text_is_kept(self):
+        assert normalize_details(" Two deer ") == "Two deer"
+        assert normalize_details("{not json") == "{not json"
+
+    def test_rejects_non_json_and_too_large(self):
+        with pytest.raises(ServiceValidationError):
+            normalize_details({"s": {1, 2}})
+        with pytest.raises(ServiceValidationError):
+            normalize_details("x" * (64 * 1024 + 1))
+
+
+class TestEventDetails:
+    DETAILS = {
+        "animals": [{"species": "gray squirrel", "count": 1, "age": "adult"}],
+        "ratings": {"cute": {"reason": "Tiny paws.", "level": "slightly cute"}},
+    }
+
+    async def _setup(self, tl, **kwargs) -> str:
+        await tl._initialize_db()
+        await TestCategoryAndLabels()._create(tl, category="animal", **kwargs)
+        return tl.events[0].uid
+
+    async def _update(self, tl, uid, **kwargs):
+        now = dt_util.utcnow()
+        await tl.update_event(
+            uid=uid,
+            start=now,
+            end=now + datetime.timedelta(minutes=1),
+            title="Something moved",
+            description="",
+            key_frame="",
+            camera_name="",
+            **kwargs,
+        )
+
+    async def test_stored_and_returned(self, build_timeline):
+        tl = build_timeline(retention=0)
+        uid = await self._setup(tl, details=self.DETAILS)
+
+        assert (await tl.get_events_json(limit=None))[0]["details"] == self.DETAILS
+        assert (await tl.get_event(uid))["details"] == self.DETAILS
+        assert tl.events[0].details == self.DETAILS
+
+    async def test_event_without_details(self, build_timeline):
+        tl = build_timeline(retention=0)
+        uid = await self._setup(tl)
+        assert (await tl.get_event(uid))["details"] is None
+
+    async def test_update_keeps_replaces_and_clears(self, build_timeline):
+        tl = build_timeline(retention=0)
+        uid = await self._setup(tl, details=self.DETAILS)
+
+        await self._update(tl, uid)
+        assert (await tl.get_event(uid))["details"] == self.DETAILS
+
+        await self._update(tl, uid, details={"mood": "calm"})
+        assert (await tl.get_event(uid))["details"] == {"mood": "calm"}
+
+        await self._update(tl, uid, details=None)
+        assert (await tl.get_event(uid))["details"] is None
+
+    async def test_v6_db_gains_details_column(self, build_timeline, caplog):
+        tl = build_timeline(retention=0)
+        await tl._initialize_db()
+        # The v6 schema: v5 plus labels, no details
+        uid = (await TestLabelsMigration._make_v5_db(tl._db_path))["car"]
+        async with aiosqlite.connect(tl._db_path) as db:
+            await db.execute("ALTER TABLE events ADD COLUMN labels TEXT")
+            await db.execute("""UPDATE events SET labels = '["car"]'""")
+            await db.execute("PRAGMA user_version = 6")
+            await db.commit()
+        assert not await tl._has_latest_schema()
+
+        tl._migrating = True
+        await tl._startup()
+
+        assert await tl._has_latest_schema()
+        assert await tl._get_db_version() == DB_VERSION
+        car = await tl.get_event(uid)
+        assert (car["labels"], car["details"]) == (["car"], None)
+        assert not [r for r in caplog.records if r.levelname == "ERROR"]

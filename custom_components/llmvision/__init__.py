@@ -535,6 +535,8 @@ class ServiceCallData:
         # Validated by Timeline.create_event. Its labels are self.labels, which
         # is read under Get Events (the same field name).
         self.category: str = data_call.data.get("category", "")
+        # Extra structured data, validated by Timeline.create_event
+        self.details = data_call.data.get("details")
 
         # ------------- Get Events --------------
         self.start: datetime = data_call.data.get(
@@ -979,6 +981,7 @@ def setup(hass, config):
             clip=clip or None,
             category=call.category,
             labels=call.labels,
+            details=call.details,
         )
         async_dispatcher_send(hass, SIGNAL_TIMELINE_UPDATED)
 

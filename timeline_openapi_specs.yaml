@@ -74,6 +74,10 @@ components:
             type: string
           description: Free-text lowercase tags, most important first.
           example: [squirrel, bird feeder]
+        details:
+          nullable: true
+          description: Extra structured data (any JSON value), or null.
+          example: {animals: [{species: gray squirrel, count: 1}]}
 
     EventListResponse:
       type: object
@@ -132,6 +136,10 @@ components:
           type: string
           description: Single label, put before labels. Lowercased before persistence.
           default: ""
+        details:
+          description: |
+            Extra structured data: any JSON value, at most 64 KB. A string
+            holding a JSON object or array is parsed. Empty values store null.
         start:
           oneOf:
             - type: string
@@ -177,6 +185,8 @@ components:
         label:
           type: string
           description: Single label, put before labels. Lowercased before persistence.
+        details:
+          description: Replaces the event's details; null or {} clears them. Omitted keeps them.
         start:
           oneOf:
             - type: string

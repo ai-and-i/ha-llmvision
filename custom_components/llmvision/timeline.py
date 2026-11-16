@@ -21,7 +21,10 @@ import logging
 
 _LOGGER = logging.getLogger(__name__)
 
-DB_VERSION = 6
+DB_VERSION = 7
+
+# Largest details value (as JSON) an event may carry
+MAX_DETAILS_BYTES = 64 * 1024
 
 # Unlinked files younger than this are kept by _cleanup. Snapshots only need
 # to survive the event insert. A clip from video_analyzer may be attached by a
@@ -102,6 +105,52 @@ def normalize_labels(labels) -> list[str]:
         if text and text not in result:
             result.append(text)
     return result
+
+
+def normalize_details(details):
+    """Extra structured data of an event as stored, or None for none.
+
+    details is any JSON value: usually an object such as the model's
+    structured response. A string holding a JSON object or array is parsed.
+    Empty values (None, "", {}, []) mean no details.
+    Raises ServiceValidationError when it isn't JSON or is too large.
+    """
+    if isinstance(details, str):
+        text = details.strip()
+        if not text:
+            return None
+        if text[0] in "{[":
+            try:
+                details = json.loads(text)
+            except ValueError:
+                details = text
+        else:
+            details = text
+    if details is None or details == {} or details == []:
+        return None
+    try:
+        encoded = json.dumps(details, ensure_ascii=False)
+    except (TypeError, ValueError) as e:
+        raise ServiceValidationError(f"details must be JSON data: {e}") from e
+    if len(encoded.encode("utf-8")) > MAX_DETAILS_BYTES:
+        raise ServiceValidationError(
+            f"details must be at most {MAX_DETAILS_BYTES} bytes as JSON"
+        )
+    return json.loads(encoded)
+
+
+def _parse_details(raw: str | None):
+    """The details column (JSON), or None."""
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except (TypeError, ValueError):
+        return raw
+
+
+def _dump_details(details) -> str | None:
+    return None if details is None else json.dumps(details, ensure_ascii=False)
 
 
 def _parse_labels(raw: str | None, label: str | None) -> list[str]:
@@ -286,6 +335,7 @@ class Event:
         label: str,
         clip: str | None = None,
         labels: list[str] | None = None,
+        details=None,
     ):
         self.uid = uid
         self.title = title
@@ -301,9 +351,11 @@ class Event:
         self.labels = list(labels) if labels is not None else ([label] if label else [])
         # Path of the saved source video, or None
         self.clip = clip or None
+        # Extra structured data (any JSON value), or None
+        self.details = details
 
     def __repr__(self):
-        return f"Event(uid={self.uid}, title={self.title}, start={self.start}, end={self.end}, description={self.description}, key_frame={self.key_frame}, camera_name={self.camera_name}, category={self.category}, label={self.label}, labels={self.labels}, clip={self.clip})"
+        return f"Event(uid={self.uid}, title={self.title}, start={self.start}, end={self.end}, description={self.description}, key_frame={self.key_frame}, camera_name={self.camera_name}, category={self.category}, label={self.label}, labels={self.labels}, clip={self.clip}, details={self.details})"
 
     def __str__(self):
         return self.__repr__()
@@ -380,6 +432,7 @@ class Timeline:
             "label",
             "clip",
             "labels",
+            "details",
         }
         try:
             async with aiosqlite.connect(self._db_path) as db:
@@ -406,7 +459,8 @@ class Timeline:
                         category TEXT,
                         label TEXT,
                         clip TEXT,
-                        labels TEXT
+                        labels TEXT,
+                        details TEXT
                     )
                 """)
                 await db.execute("""
@@ -430,7 +484,7 @@ class Timeline:
             _LOGGER.debug(f"Post-init version set skipped: {e}")
 
     async def _migrate(self):
-        """Handles migration for events.db (current v6)"""
+        """Handles migration for events.db (current v7)"""
         try:
             lock = _MIGRATION_LOCKS.setdefault(self._db_path, asyncio.Lock())
             async with lock:
@@ -445,7 +499,9 @@ class Timeline:
                     await self._migrate_to_v4()
                 if current_version < 5:
                     await self._migrate_to_v5()
-                await self._migrate_to_v6()
+                if current_version < 6:
+                    await self._migrate_to_v6()
+                await self._migrate_to_v7()
 
                 # Mark migration complete by setting user_version
                 await self._set_db_version(DB_VERSION)
@@ -677,6 +733,19 @@ class Timeline:
         except aiosqlite.Error as e:
             _LOGGER.error(f"Error migrating events.db to v6: {e}")
 
+    async def _migrate_to_v7(self):
+        """v6 -> v7: add the details column (JSON, extra structured data)."""
+        try:
+            async with aiosqlite.connect(self._db_path) as db:
+                async with db.execute("PRAGMA table_info(events)") as cursor:
+                    column_names = [column[1] for column in await cursor.fetchall()]
+                if "details" not in column_names:
+                    _LOGGER.info("Adding details column to events.db")
+                    await db.execute("ALTER TABLE events ADD COLUMN details TEXT")
+                    await db.commit()
+        except aiosqlite.Error as e:
+            _LOGGER.error(f"Error migrating events.db to v7: {e}")
+
     def _ensure_datetime(self, dt):
         """Ensures the input is a datetime.datetime object"""
         if isinstance(dt, datetime.date) and not isinstance(dt, datetime.datetime):
@@ -798,7 +867,7 @@ class Timeline:
                 async with db.execute("""
                     SELECT
                         uid, title, start, end, description,
-                        category, key_frame, camera_name, label, clip, labels
+                        category, key_frame, camera_name, label, clip, labels, details
                     FROM events
                     """) as cursor:
                     rows = await cursor.fetchall()
@@ -830,6 +899,7 @@ class Timeline:
                             label=row[8],
                             clip=row[9],
                             labels=_parse_labels(row[10], row[8]),
+                            details=_parse_details(row[11]),
                         )
                         self.events.append(event)
         except aiosqlite.Error as e:
@@ -857,6 +927,7 @@ class Timeline:
                     "label": event.label,
                     "labels": event.labels,
                     "clip": event.clip,
+                    "details": event.details,
                 }
                 return event_dict
         return None
@@ -905,7 +976,7 @@ class Timeline:
             async with db.execute("""
                 SELECT
                     uid, title, start, end, description,
-                    category, key_frame, camera_name, label, clip, labels
+                    category, key_frame, camera_name, label, clip, labels, details
                 FROM events
                 """) as cursor:
                 rows = await cursor.fetchall()
@@ -965,6 +1036,7 @@ class Timeline:
                             "label": row[8],
                             "labels": row_labels,
                             "clip": row[9] or None,
+                            "details": _parse_details(row[11]),
                         }
                     )
 
@@ -995,6 +1067,7 @@ class Timeline:
         clip: str | None = None,
         category: str | None = None,
         labels: list[str] | str | None = None,
+        details=None,
     ) -> None:
         """Adds a new event to calendar.
 
@@ -1005,9 +1078,11 @@ class Timeline:
         labels are free-text tags, most important first; label is a single
         label put before them. The first label is stored as the event's label.
         See _resolve_category_and_labels for what is used when they are empty.
-        Raises ServiceValidationError for an unknown category.
+        details is extra structured data (see normalize_details).
+        Raises ServiceValidationError for an unknown category or bad details.
         """
         # Validate before marking files pending and taking the cleanup lock
+        details = normalize_details(details)
         category, labels = await self._resolve_category_and_labels(
             category,
             normalize_labels([label, *normalize_labels(labels)]),
@@ -1046,6 +1121,7 @@ class Timeline:
                     label=labels[0] if labels else "",
                     labels=labels,
                     clip=clip,
+                    details=details,
                 )
                 _LOGGER.info(f"Creating event: {event}")
                 await self._insert_event(event)
@@ -1060,8 +1136,8 @@ class Timeline:
                 _LOGGER.info(f"Inserting event into database: {event}")
                 await db.execute(
                     """
-                    INSERT INTO events (uid, title, start, end, description, key_frame, camera_name, category, label, clip, labels)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO events (uid, title, start, end, description, key_frame, camera_name, category, label, clip, labels, details)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                     (
                         event.uid,
@@ -1077,6 +1153,7 @@ class Timeline:
                         event.label,
                         event.clip,
                         json.dumps(event.labels),
+                        _dump_details(event.details),
                     ),
                 )
                 await db.commit()
@@ -1096,16 +1173,23 @@ class Timeline:
         label: str | None = None,
         category: str | None = None,
         labels: list[str] | str | None = None,
+        details=...,
     ) -> None:
         """Updates an existing event in the calendar.
 
         category, labels and label follow the create_event rules, except that
         None keeps them: with none of them given, the event keeps its category
         and labels; with only category, it keeps its labels.
-        Raises ServiceValidationError for an unknown category.
+        details replaces the event's details when given (None or {} clears
+        them); left out, they are kept.
+        Raises ServiceValidationError for an unknown category or bad details.
         """
         await self.load_events()
         existing = next((e for e in self.events if e.uid == uid), None)
+        if details is ...:
+            details = existing.details if existing else None
+        else:
+            details = normalize_details(details)
         existing_labels = existing.labels if existing else []
         if category is None and labels is None and label is None:
             category = existing.category if existing else ""
@@ -1136,7 +1220,7 @@ class Timeline:
                 await db.execute(
                     """
                     UPDATE events
-                    SET title = ?, start = ?, end = ?, description = ?, key_frame = ?, camera_name = ?, category = ?, label = ?, labels = ?
+                    SET title = ?, start = ?, end = ?, description = ?, key_frame = ?, camera_name = ?, category = ?, label = ?, labels = ?, details = ?
                     WHERE uid = ?
                 """,
                     (
@@ -1149,6 +1233,7 @@ class Timeline:
                         category,
                         labels[0] if labels else "",
                         json.dumps(labels),
+                        _dump_details(details),
                         uid,
                     ),
                 )

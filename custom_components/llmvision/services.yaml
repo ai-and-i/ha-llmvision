@@ -815,6 +815,16 @@ create_event:
       selector:
         text:
           multiline: false
+    details:
+      name: Details
+      required: false
+      description: >-
+        Extra structured data about the event, such as more fields from a JSON
+        response. Any JSON object, list or text, at most 64 KB. The timeline
+        card shows it in a collapsed Details section of the event popup.
+      example: '{"animals": [{"species": "squirrel", "count": 1}], "mood": "playful"}'
+      selector:
+        object:
     camera_entity:
       name: Camera Entity
       required: false
