@@ -41,8 +41,9 @@ def _scale_filter(target_width):
     """ffmpeg filter that downscales to target_width, keeping both sides even.
 
     Smaller videos are left at their size; H.264 needs even dimensions.
+    Lanczos keeps small, distant objects sharper than the default bicubic.
     """
-    return f"scale='trunc(min(iw,{int(target_width)})/2)*2':-2"
+    return f"scale='trunc(min(iw,{int(target_width)})/2)*2':-2:flags=lanczos"
 
 
 def _read_file(path):
@@ -680,10 +681,12 @@ class MediaProcessor:
             "-",  # frames arrive on stdin
             "-c:v",
             "libx264",
+            # Near visually lossless: at low fps each frame differs a lot from
+            # the last, so a higher CRF blurs away small, low-contrast details
             "-preset",
-            "veryfast",
+            "slow",
             "-crf",
-            "28",
+            "16",
             "-pix_fmt",
             "yuv420p",  # what players and APIs expect from H.264
             "-movflags",
@@ -806,7 +809,8 @@ class MediaProcessor:
                 # Evenly spaced frames, scaled for both images and video.
                 # ffmpeg stops after max_frames, dropping the rest of the video.
                 frame_filter = f"fps={fps:g},{_scale_filter(target_width)}"
-                frame_limit = ["-frames:v", str(max_frames)]
+                # Full-resolution colour: these JPEGs are sent as they are
+                frame_limit = ["-frames:v", str(max_frames), "-pix_fmt", "yuvj444p"]
             else:
                 frame_filter = "select=eq(pict_type\\,I)"  # select only I-frames
                 frame_limit = []
@@ -817,7 +821,7 @@ class MediaProcessor:
                 "-vsync",
                 "0",  # disable v-sync to avoid frame duplication
                 "-q:v",  # quality level for JPEG (lower is better)
-                "5",  # 5 medium quality
+                "2",  # near lossless: the video is encoded from these frames
                 "-f",
                 "image2pipe",  # output to pipe
                 "-vcodec",
@@ -1055,9 +1059,13 @@ class MediaProcessor:
             # Add frames to client
             resized_base64 = []
             for idx, (frame_data, _, _) in enumerate(selected_frames, start=1):
-                resized_image = await self.resize_image(
-                    target_width=target_width, image_data=frame_data
-                )
+                if constant_fps:
+                    # ffmpeg already scaled these; re-encoding would only lose detail
+                    resized_image = base64.b64encode(frame_data).decode("utf-8")
+                else:
+                    resized_image = await self.resize_image(
+                        target_width=target_width, image_data=frame_data
+                    )
                 resized_base64.append(resized_image)
                 self.client.add_frame(
                     base64_image=resized_image,

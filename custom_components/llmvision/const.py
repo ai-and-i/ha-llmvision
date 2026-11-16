@@ -75,6 +75,10 @@ FPS = "fps"
 FPS_MODE = "fps_mode"
 FPS_MODE_VARIABLE = "variable"  # max_frames frames with the most change
 FPS_MODE_CONSTANT = "constant"  # one frame every 1/fps seconds, up to max_frames
+# Constant fps mode only: how frames reach providers that take video natively
+SEND_FRAMES_AS = "send_frames_as"
+SEND_AS_VIDEO = "video"  # one encoded video (Gemini: ~280 tokens per frame at high)
+SEND_AS_IMAGES = "images"  # separate images (Gemini: ~1120 tokens per image at high)
 SAVE_CLIP = "save_clip"
 CLIP_PATH = "clip_path"
 # Google Gemini only: generationConfig.mediaResolution, applied to every

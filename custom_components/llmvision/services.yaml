@@ -245,6 +245,23 @@ video_analyzer:
               value: variable
             - label: Constant (fixed frame rate)
               value: constant
+    send_frames_as:
+      name: Send Frames As
+      required: false
+      description: >-
+        Constant mode only, for providers that accept video (Google Gemini):
+        send the frames as one video, or as separate images. Gemini spends
+        about 4x more tokens on each image than on each video frame at high
+        media resolution, so it sees more detail.
+      default: video
+      example: images
+      selector:
+        select:
+          options:
+            - label: Video
+              value: video
+            - label: Images
+              value: images
     max_frames:
       name: Max Frames
       description: >-

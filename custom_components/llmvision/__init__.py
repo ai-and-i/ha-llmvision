@@ -59,6 +59,9 @@ from .const import (
     FPS_MODE_CONSTANT,
     FPS_MODE_VARIABLE,
     MEDIA_RESOLUTION,
+    SEND_FRAMES_AS,
+    SEND_AS_VIDEO,
+    SEND_AS_IMAGES,
     MEDIA_RESOLUTIONS,
     SAVE_CLIP,
     CLIP_PATH,
@@ -492,6 +495,13 @@ class ServiceCallData:
         self.fps: float = 1.0 if fps is None else float(fps)
         if self.fps_mode == FPS_MODE_CONSTANT and self.fps <= 0:
             raise ServiceValidationError(f"fps must be greater than 0, got {fps}")
+        # Constant mode: send frames as one video (where supported) or as images
+        send_as = str(data_call.data.get(SEND_FRAMES_AS) or SEND_AS_VIDEO).strip().lower()
+        if send_as not in (SEND_AS_VIDEO, SEND_AS_IMAGES):
+            raise ServiceValidationError(
+                f"send_frames_as must be '{SEND_AS_VIDEO}' or '{SEND_AS_IMAGES}', got '{send_as}'"
+            )
+        self.send_frames_as: str = send_as
         # Google Gemini only; None leaves mediaResolution out of the request
         media_resolution = str(data_call.data.get(MEDIA_RESOLUTION) or "").strip()
         self.media_resolution: str | None = media_resolution.lower() or None
@@ -770,7 +780,9 @@ def setup(hass, config):
         constant_fps = call.fps_mode == FPS_MODE_CONSTANT
         # In constant mode, providers that take video natively get the frames
         # as a video. The frames are still sent for fallback providers.
-        encode_video = constant_fps and ProviderFactory.supports_video_input(
+        encode_video = (
+            constant_fps and call.send_frames_as == SEND_AS_VIDEO
+        ) and ProviderFactory.supports_video_input(
             Request.get_provider(hass, call.provider),
             call.model or request.get_default_model(call.provider),
         )
