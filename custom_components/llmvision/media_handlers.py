@@ -808,7 +808,10 @@ class MediaProcessor:
             if constant_fps:
                 # Evenly spaced frames, scaled for both images and video.
                 # ffmpeg stops after max_frames, dropping the rest of the video.
-                frame_filter = f"fps={fps:g},{_scale_filter(target_width)}"
+                # round=up: frame n is the picture at n / fps seconds (the
+                # default, near, takes the last frame before (n + 0.5) / fps,
+                # half a frame late against the clip's timeline)
+                frame_filter = f"fps={fps:g}:round=up,{_scale_filter(target_width)}"
                 # Full-resolution colour: these JPEGs are sent as they are
                 frame_limit = ["-frames:v", str(max_frames), "-pix_fmt", "yuvj444p"]
             else:
