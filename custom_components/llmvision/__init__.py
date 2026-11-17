@@ -598,6 +598,51 @@ class ServiceCallData:
         return bool(self.model and "glimpse-v1" in self.model.lower())
 
 
+async def _call_with_retry(request, call) -> dict:
+    """The provider's response to call, retried once when it fails.
+
+    A request fails when it raises (an HTTP error, a timeout, a provider
+    error) or when a JSON response was asked for (response_format json) and
+    the reply has no valid JSON, such as an empty reply after the model spent
+    all of max_tokens thinking. The retry reuses the media already prepared.
+    After a second failure the problem is logged as an error and raised.
+    """
+    provider, model, message = call.provider, call.model, call.message
+    problems = []
+    for attempt in (1, 2):
+        if attempt == 2:
+            # A fallback provider or title request may have changed these
+            call.provider, call.model, call.message = provider, model, message
+        try:
+            response = await request.call(call)
+        except Exception as e:
+            problems.append(str(e).strip() or e.__class__.__name__)
+        else:
+            if call.response_format != "json" or isinstance(
+                response.get("structured_response"), (dict, list)
+            ):
+                return response
+            usage = response.get("usage") or {}
+            problems.append(
+                "reply without valid JSON"
+                + (
+                    f" (output tokens {usage.get('output_tokens')}, thinking tokens {usage.get('thinking_tokens')})"
+                    if usage
+                    else ""
+                )
+            )
+        if attempt == 1:
+            _LOGGER.warning(
+                f"{provider} analysis failed ({problems[-1]}); retrying once"
+            )
+    _LOGGER.error(
+        f"{provider} analysis failed twice: {problems[0]}; then {problems[1]}"
+    )
+    raise ServiceValidationError(
+        f"Analysis failed after one retry: {problems[1]}"
+    )
+
+
 async def _create_event(
     hass,
     call: ServiceCallData,
@@ -751,7 +796,7 @@ def setup(hass, config):
         await call.memory._update_memory()
 
         # Validate configuration, input data and make the call
-        response = await request.call(call)
+        response = await _call_with_retry(request, call)
         _LOGGER.info(f"Response: {response}")
         # Add processor.key_frame to response if it exists
         if processor.key_frame:
@@ -815,7 +860,7 @@ def setup(hass, config):
         call.memory = Memory(hass)
         await call.memory._update_memory()
 
-        response = await request.call(call)
+        response = await _call_with_retry(request, call)
         # Add processor.key_frame to response if it exists
         if processor.key_frame:
             response["key_frame"] = processor.key_frame
@@ -859,7 +904,7 @@ def setup(hass, config):
         call.memory = Memory(hass)
         await call.memory._update_memory()
 
-        response = await request.call(call)
+        response = await _call_with_retry(request, call)
         # Add processor.key_frame to response if it exists
         if processor.key_frame:
             response["key_frame"] = processor.key_frame
@@ -940,7 +985,7 @@ def setup(hass, config):
         call.memory = Memory(hass)
         await call.memory._update_memory()
 
-        response = await request.call(call)
+        response = await _call_with_retry(request, call)
         # Add processor.key_frame to response if it exists
         if processor.key_frame:
             response["key_frame"] = processor.key_frame
