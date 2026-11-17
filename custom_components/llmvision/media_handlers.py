@@ -84,6 +84,9 @@ class MediaProcessor:
         self.clips_path = CLIPS_DIR
         # Path of the source video saved by add_video(save_clip=True)
         self.clip = ""
+        # Frames sent from each video (base64 JPEGs), in the order labelled
+        # "Video frame 1", "Video frame 2", ...; see key_frame_from_boxes
+        self.video_frames = []
 
     async def _encode_image(self, img):
         """Encode image as base64"""
@@ -208,6 +211,91 @@ class MediaProcessor:
                 best_score = score
                 best_idx = idx
         return best_idx
+
+    @staticmethod
+    def best_box_frame(structured_response, frame_count):
+        """The frame number (1-based) that best shows what the reply boxed.
+
+        The reply's top-level lists (such as animals and people) hold entries
+        with "boxes": [{"frame": n, "box_2d": [ymin, xmin, ymax, xmax]}],
+        scaled to 0-1000. Frames are ranked by how many boxes they have, then
+        by boxes from the first list that has any (animals before people),
+        then by that list's total box area, then by the total area of all
+        boxes. None when the reply has no usable boxes.
+        """
+        if not isinstance(structured_response, dict):
+            return None
+        scores = {}
+        primary = None
+        for key, entries in structured_response.items():
+            if not isinstance(entries, list):
+                continue
+            for entry in entries:
+                boxes = entry.get("boxes") if isinstance(entry, dict) else None
+                if not isinstance(boxes, list):
+                    continue
+                for box in boxes:
+                    if not isinstance(box, dict):
+                        continue
+                    frame, coords = box.get("frame"), box.get("box_2d")
+                    if (
+                        not isinstance(frame, int)
+                        or isinstance(frame, bool)
+                        or not 1 <= frame <= frame_count
+                        or not isinstance(coords, list)
+                        or len(coords) != 4
+                        or not all(isinstance(c, (int, float)) for c in coords)
+                    ):
+                        continue
+                    ymin, xmin, ymax, xmax = (min(max(c, 0), 1000) for c in coords)
+                    area = max(ymax - ymin, 0) * max(xmax - xmin, 0)
+                    if area <= 0:
+                        continue
+                    if primary is None:
+                        primary = key
+                    count, primary_count, primary_area, total_area = scores.get(
+                        frame, (0, 0, 0, 0)
+                    )
+                    is_primary = key == primary
+                    scores[frame] = (
+                        count + 1,
+                        primary_count + is_primary,
+                        primary_area + (area if is_primary else 0),
+                        total_area + area,
+                    )
+        if not scores:
+            return None
+        # Earliest frame on a tie
+        return max(scores, key=lambda f: (scores[f], -f))
+
+    async def key_frame_from_boxes(self, structured_response):
+        """Replace the exposed key frame with the frame that best shows the
+        boxed subjects (see best_box_frame), when the reply has boxes.
+
+        Only for a single video, whose frames match the reply's frame numbers.
+        """
+        if not self.key_frame or len(self.video_frames) != 1:
+            return
+        frames = self.video_frames[0]
+        frame = self.best_box_frame(structured_response, len(frames))
+        if frame is None:
+            return
+        old = self.key_frame
+        uid = os.path.basename(old).split("-", 1)[0] or str(uuid.uuid4())[:8]
+        filename = f"/media/{DOMAIN}/snapshots/{uid}-{frame}.jpg"
+        if filename == old:
+            return
+        await self._save_clip(image_data=frames[frame - 1], image_path=filename)
+        self.key_frame = filename
+
+        def _remove(path):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+        await self.hass.loop.run_in_executor(None, _remove, old)
+        _LOGGER.info(f"Key frame: frame {frame}, chosen from the reply's boxes")
 
     async def resize_image(
         self, target_width, image_path=None, image_data=None, img=None
@@ -1078,6 +1166,8 @@ class MediaProcessor:
                         else f"Video frame {idx}"
                     ),
                 )
+
+            self.video_frames.append(resized_base64)
 
             if expose_images and selected_frames:
                 # Expose keyframe if requested

@@ -861,6 +861,8 @@ def setup(hass, config):
         await call.memory._update_memory()
 
         response = await _call_with_retry(request, call)
+        # A reply with boxes picks the key frame that shows them best
+        await processor.key_frame_from_boxes(response.get("structured_response"))
         # Add processor.key_frame to response if it exists
         if processor.key_frame:
             response["key_frame"] = processor.key_frame
