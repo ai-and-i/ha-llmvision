@@ -712,12 +712,6 @@ class OpenAI(Provider):
         headers = self._generate_headers()
         url = self._get_request_url()
 
-        # Debug logging for OpenRouter
-        if "openrouter.ai" in url:
-            print(f"[OpenRouter DEBUG] URL: {url}")
-            print(f"[OpenRouter DEBUG] Headers: {headers}")
-            print(f"[OpenRouter DEBUG] Data: {Request.sanitize_data(data)}")
-
         response = await self._post(url=url, headers=headers, data=data)
         choices = response.get("choices") if isinstance(response, dict) else None
         if not isinstance(choices, list) or not choices:
