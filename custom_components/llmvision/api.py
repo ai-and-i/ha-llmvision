@@ -323,3 +323,41 @@ class TimelineEventView(HomeAssistantView):
             return self.json({"event": json.loads(json_dumps(updated))})
         except Exception:
             return self.json({"event_id": event_id, "status": "updated"})
+
+
+class TimelineEventFeedbackView(HomeAssistantView):
+    """The user's feedback on an event's current analysis.
+
+    POST {"verdict": "correct" | "incorrect", "comment": "..."} sets it,
+    {"verdict": null} clears it. Returns {"event": ...} with the feedback.
+    Feedback is kept for scoring: events with it are not purged, and it
+    moves to the event's history when the event is analyzed again.
+    """
+
+    url = "/api/llmvision/timeline/event/{event_id}/feedback"
+    name = "api:llmvision:timeline:event:feedback"
+    requires_auth = True
+
+    async def post(self, request, event_id):
+        hass = request.app["hass"]
+        settings_entry = await async_get_settings_entry(hass)
+        if settings_entry is None:
+            return self.json_message("Settings config entry not found", status_code=404)
+        try:
+            data = await request.json()
+        except Exception:
+            return self.json_message("Invalid JSON body", status_code=400)
+        if not isinstance(data, dict):
+            return self.json_message("Body must be a JSON object", status_code=400)
+        timeline = Timeline(hass, settings_entry)
+        try:
+            event = await timeline.set_feedback(event_id, data.get("verdict"), data.get("comment"))
+        except ServiceValidationError as e:
+            return self.json_message(str(e), status_code=400)
+        except Exception as e:
+            _LOGGER.error(f"Error saving feedback for event {event_id}: {e}")
+            return self.json_message("Error saving feedback", status_code=500)
+        if event is None:
+            return self.json_message("Event not found", status_code=404)
+        async_dispatcher_send(hass, SIGNAL_TIMELINE_UPDATED)
+        return self.json({"event": json.loads(json_dumps(event))})

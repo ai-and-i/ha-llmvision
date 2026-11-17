@@ -21,10 +21,17 @@ import logging
 
 _LOGGER = logging.getLogger(__name__)
 
-DB_VERSION = 7
+DB_VERSION = 8
 
 # Largest details value (as JSON) an event may carry
 MAX_DETAILS_BYTES = 64 * 1024
+
+# The user's verdict on an event's analysis (set_feedback), and the longest
+# comment that may come with it
+FEEDBACK_VERDICTS = ("correct", "incorrect")
+MAX_FEEDBACK_COMMENT = 4000
+# Earlier analyses kept per event (history), oldest dropped first
+MAX_HISTORY = 20
 
 # Unlinked files younger than this are kept by _cleanup. Snapshots only need
 # to survive the event insert. A clip from video_analyzer may be attached by a
@@ -151,6 +158,23 @@ def _parse_details(raw: str | None):
 
 def _dump_details(details) -> str | None:
     return None if details is None else json.dumps(details, ensure_ascii=False)
+
+
+def _parse_feedback(raw: str | None) -> dict | None:
+    """The feedback column: {verdict, comment, given, updated}, or None."""
+    value = _parse_details(raw)
+    return value if isinstance(value, dict) and value.get("verdict") else None
+
+
+def _parse_history(raw: str | None) -> list:
+    """The history column: earlier analyses, oldest first."""
+    value = _parse_details(raw)
+    return value if isinstance(value, list) else []
+
+
+def _has_feedback(feedback, history) -> bool:
+    """Whether the user gave feedback on the event's analysis, current or earlier."""
+    return bool(feedback) or any(isinstance(h, dict) and h.get("feedback") for h in history or [])
 
 
 def _parse_labels(raw: str | None, label: str | None) -> list[str]:
@@ -336,6 +360,8 @@ class Event:
         clip: str | None = None,
         labels: list[str] | None = None,
         details=None,
+        feedback: dict | None = None,
+        history: list | None = None,
     ):
         self.uid = uid
         self.title = title
@@ -353,6 +379,10 @@ class Event:
         self.clip = clip or None
         # Extra structured data (any JSON value), or None
         self.details = details
+        # The user's verdict on the current analysis (set_feedback), or None
+        self.feedback = feedback
+        # Earlier analyses of the clip, each with the feedback it had, oldest first
+        self.history = list(history) if history else []
 
     def __repr__(self):
         return f"Event(uid={self.uid}, title={self.title}, start={self.start}, end={self.end}, description={self.description}, key_frame={self.key_frame}, camera_name={self.camera_name}, category={self.category}, label={self.label}, labels={self.labels}, clip={self.clip}, details={self.details})"
@@ -433,6 +463,8 @@ class Timeline:
             "clip",
             "labels",
             "details",
+            "feedback",
+            "history",
         }
         try:
             async with aiosqlite.connect(self._db_path) as db:
@@ -460,7 +492,9 @@ class Timeline:
                         label TEXT,
                         clip TEXT,
                         labels TEXT,
-                        details TEXT
+                        details TEXT,
+                        feedback TEXT,
+                        history TEXT
                     )
                 """)
                 await db.execute("""
@@ -484,7 +518,7 @@ class Timeline:
             _LOGGER.debug(f"Post-init version set skipped: {e}")
 
     async def _migrate(self):
-        """Handles migration for events.db (current v7)"""
+        """Handles migration for events.db (current v8)"""
         try:
             lock = _MIGRATION_LOCKS.setdefault(self._db_path, asyncio.Lock())
             async with lock:
@@ -502,6 +536,7 @@ class Timeline:
                 if current_version < 6:
                     await self._migrate_to_v6()
                 await self._migrate_to_v7()
+                await self._migrate_to_v8()
 
                 # Mark migration complete by setting user_version
                 await self._set_db_version(DB_VERSION)
@@ -746,6 +781,20 @@ class Timeline:
         except aiosqlite.Error as e:
             _LOGGER.error(f"Error migrating events.db to v7: {e}")
 
+    async def _migrate_to_v8(self):
+        """v7 -> v8: add the feedback and history columns (JSON)."""
+        try:
+            async with aiosqlite.connect(self._db_path) as db:
+                async with db.execute("PRAGMA table_info(events)") as cursor:
+                    column_names = [column[1] for column in await cursor.fetchall()]
+                for column in ("feedback", "history"):
+                    if column not in column_names:
+                        _LOGGER.info(f"Adding {column} column to events.db")
+                        await db.execute(f"ALTER TABLE events ADD COLUMN {column} TEXT")
+                await db.commit()
+        except aiosqlite.Error as e:
+            _LOGGER.error(f"Error migrating events.db to v8: {e}")
+
     def _ensure_datetime(self, dt):
         """Ensures the input is a datetime.datetime object"""
         if isinstance(dt, datetime.date) and not isinstance(dt, datetime.datetime):
@@ -793,12 +842,18 @@ class Timeline:
             async with aiosqlite.connect(self._db_path) as db:
                 async with db.execute(
                     """
-                    SELECT uid, key_frame FROM events
+                    SELECT uid, key_frame, feedback, history FROM events
                     WHERE start IS NOT NULL AND start < ?
                 """,
                     (cutoff_local,),
                 ) as cursor:
-                    stale_rows = list(await cursor.fetchall())
+                    # Events with the user's feedback are kept for scoring,
+                    # with their key frame and clip
+                    stale_rows = [
+                        row
+                        for row in await cursor.fetchall()
+                        if not _has_feedback(_parse_feedback(row[2]), _parse_history(row[3]))
+                    ]
 
                 if not stale_rows:
                     return
@@ -867,7 +922,8 @@ class Timeline:
                 async with db.execute("""
                     SELECT
                         uid, title, start, end, description,
-                        category, key_frame, camera_name, label, clip, labels, details
+                        category, key_frame, camera_name, label, clip, labels, details,
+                        feedback, history
                     FROM events
                     """) as cursor:
                     rows = await cursor.fetchall()
@@ -900,6 +956,8 @@ class Timeline:
                             clip=row[9],
                             labels=_parse_labels(row[10], row[8]),
                             details=_parse_details(row[11]),
+                            feedback=_parse_feedback(row[12]),
+                            history=_parse_history(row[13]),
                         )
                         self.events.append(event)
         except aiosqlite.Error as e:
@@ -928,6 +986,8 @@ class Timeline:
                     "labels": event.labels,
                     "clip": event.clip,
                     "details": event.details,
+                    "feedback": event.feedback,
+                    "history": event.history,
                 }
                 return event_dict
         return None
@@ -976,7 +1036,8 @@ class Timeline:
             async with db.execute("""
                 SELECT
                     uid, title, start, end, description,
-                    category, key_frame, camera_name, label, clip, labels, details
+                    category, key_frame, camera_name, label, clip, labels, details,
+                        feedback, history
                 FROM events
                 """) as cursor:
                 rows = await cursor.fetchall()
@@ -1037,6 +1098,8 @@ class Timeline:
                             "labels": row_labels,
                             "clip": row[9] or None,
                             "details": _parse_details(row[11]),
+                            "feedback": _parse_feedback(row[12]),
+                            "history_count": len(_parse_history(row[13])),
                         }
                     )
 
@@ -1182,6 +1245,10 @@ class Timeline:
         and labels; with only category, it keeps its labels.
         details replaces the event's details when given (None or {} clears
         them); left out, they are kept.
+        When the analysis changes (title, description, category, labels or
+        details), the previous one goes to the event's history with the
+        user's feedback on it, and the feedback is cleared: it was about the
+        old analysis. Up to MAX_HISTORY earlier analyses are kept.
         Raises ServiceValidationError for an unknown category or bad details.
         """
         await self.load_events()
@@ -1214,13 +1281,40 @@ class Timeline:
         start = dt_util.as_local(start)
         end = dt_util.as_local(end)
 
+        feedback = existing.feedback if existing else None
+        history = list(existing.history) if existing else []
+        if existing is not None:
+            def analysis(title_, description_, category_, labels_, details_):
+                return json.dumps(
+                    [title_ or "", description_ or "", category_ or "", list(labels_ or []), details_],
+                    sort_keys=True,
+                    ensure_ascii=False,
+                )
+
+            before = analysis(existing.title, existing.description, existing.category, existing.labels, existing.details)
+            after = analysis(title, description, category, labels, details)
+            if before != after:
+                history.append(
+                    {
+                        "title": existing.title,
+                        "description": existing.description,
+                        "category": existing.category,
+                        "labels": existing.labels,
+                        "details": existing.details,
+                        "feedback": existing.feedback,
+                        "replaced": dt_util.now().isoformat(),
+                    }
+                )
+                history = history[-MAX_HISTORY:]
+                feedback = None
+
         try:
             async with aiosqlite.connect(self._db_path) as db:
                 _LOGGER.info(f"Updating event with UID {uid}")
                 await db.execute(
                     """
                     UPDATE events
-                    SET title = ?, start = ?, end = ?, description = ?, key_frame = ?, camera_name = ?, category = ?, label = ?, labels = ?, details = ?
+                    SET title = ?, start = ?, end = ?, description = ?, key_frame = ?, camera_name = ?, category = ?, label = ?, labels = ?, details = ?, feedback = ?, history = ?
                     WHERE uid = ?
                 """,
                     (
@@ -1234,6 +1328,8 @@ class Timeline:
                         labels[0] if labels else "",
                         json.dumps(labels),
                         _dump_details(details),
+                        json.dumps(feedback, ensure_ascii=False) if feedback else None,
+                        json.dumps(history, ensure_ascii=False) if history else None,
                         uid,
                     ),
                 )
@@ -1241,6 +1337,47 @@ class Timeline:
                 await self.load_events()
         except aiosqlite.Error as e:
             _LOGGER.error(f"Error updating event in database: {e}")
+
+    async def set_feedback(self, uid: str, verdict, comment=None) -> dict | None:
+        """Sets the user's feedback on the event's current analysis, or clears it.
+
+        verdict is "correct" or "incorrect"; None or "" clears the feedback.
+        comment is free text (at most MAX_FEEDBACK_COMMENT characters). Stored
+        as {verdict, comment, given, updated}: given is when feedback was
+        first given on this analysis, updated when it last changed. Returns
+        the event as get_event does, or None when there is no such event.
+        Raises ServiceValidationError for another verdict or a long comment.
+        """
+        verdict = "" if verdict is None else str(verdict).strip().lower()
+        if verdict and verdict not in FEEDBACK_VERDICTS:
+            raise ServiceValidationError(
+                f"verdict must be one of {', '.join(FEEDBACK_VERDICTS)}, got '{verdict}'"
+            )
+        comment = "" if comment is None else str(comment).strip()
+        if len(comment) > MAX_FEEDBACK_COMMENT:
+            raise ServiceValidationError(
+                f"comment must be at most {MAX_FEEDBACK_COMMENT} characters, got {len(comment)}"
+            )
+        existing = await self.get_event(uid)
+        if existing is None:
+            return None
+        feedback = None
+        if verdict:
+            now = dt_util.now().isoformat()
+            given = (existing.get("feedback") or {}).get("given") or now
+            feedback = {"verdict": verdict, "comment": comment, "given": given, "updated": now}
+        try:
+            async with aiosqlite.connect(self._db_path) as db:
+                await db.execute(
+                    "UPDATE events SET feedback = ? WHERE uid = ?",
+                    (json.dumps(feedback, ensure_ascii=False) if feedback else None, uid),
+                )
+                await db.commit()
+        except aiosqlite.Error as e:
+            _LOGGER.error(f"Error saving feedback for event {uid}: {e}")
+            raise
+        _LOGGER.info(f"Feedback on event {uid}: {feedback['verdict'] if feedback else 'cleared'}")
+        return await self.get_event(uid)
 
     async def delete_event(
         self,
