@@ -40,9 +40,49 @@ MAX_FEEDBACK_MARKS = 200
 _MARK_PART = re.compile(r"^[a-z0-9_]{1,40}(\.[a-z0-9_]{1,40}){0,3}$")
 
 
+MAX_MARK_TEXT = 100
+
+
+def _mark_value(value, part):
+    """A mark's optional value, what the part should be: text, a whole
+    number, or (for a missed animal or person) an object of those, such as
+    {"species": "raccoon", "count": 2}. None when not given."""
+    def plain(v):
+        if isinstance(v, bool):
+            raise ServiceValidationError(f"invalid value for mark '{part}'")
+        if isinstance(v, int):
+            if not 0 <= v <= 10000:
+                raise ServiceValidationError(f"value out of range for mark '{part}'")
+            return v
+        if isinstance(v, str):
+            v = v.strip()
+            if len(v) > MAX_MARK_TEXT:
+                raise ServiceValidationError(
+                    f"value for mark '{part}' must be at most {MAX_MARK_TEXT} characters"
+                )
+            return v or None
+        if v is None:
+            return None
+        raise ServiceValidationError(f"invalid value for mark '{part}'")
+
+    if isinstance(value, dict):
+        if len(value) > 4:
+            raise ServiceValidationError(f"value for mark '{part}' has too many fields")
+        out = {}
+        for key, v in value.items():
+            if not isinstance(key, str) or not _MARK_PART.match(key) or "." in key:
+                raise ServiceValidationError(f"invalid field '{key}' for mark '{part}'")
+            v = plain(v)
+            if v is not None:
+                out[key] = v
+        return out or None
+    return plain(value)
+
+
 def _parse_marks(marks) -> list[dict]:
-    """Validated feedback marks, [{part, severity}], one per part (the last
-    one given wins). Raises ServiceValidationError for a malformed mark."""
+    """Validated feedback marks, [{part, severity, value?}], one per part (the
+    last one given wins). value, when given, is what the part should be.
+    Raises ServiceValidationError for a malformed mark."""
     if marks is None:
         return []
     if not isinstance(marks, list):
@@ -61,8 +101,12 @@ def _parse_marks(marks) -> list[dict]:
             raise ServiceValidationError(
                 f"mark severity must be one of {', '.join(MARK_SEVERITIES)}, got '{severity}'"
             )
+        entry = {"part": part, "severity": severity}
+        value = _mark_value(mark.get("value"), part)
+        if value is not None:
+            entry["value"] = value
         by_part.pop(part, None)
-        by_part[part] = {"part": part, "severity": severity}
+        by_part[part] = entry
     return list(by_part.values())
 # Earlier analyses kept per event (history), oldest dropped first
 MAX_HISTORY = 20
@@ -204,6 +248,19 @@ def _parse_history(raw: str | None) -> list:
     """The history column: earlier analyses, oldest first."""
     value = _parse_details(raw)
     return value if isinstance(value, list) else []
+
+
+def _trim_history(history: list) -> list:
+    """history cut to MAX_HISTORY entries, dropping the oldest analyses
+    without feedback first: reviewed ones are the ground truth for scoring."""
+    history = list(history)
+    while len(history) > MAX_HISTORY:
+        unreviewed = next(
+            (i for i, h in enumerate(history) if not (isinstance(h, dict) and h.get("feedback"))),
+            0,
+        )
+        del history[unreviewed]
+    return history
 
 
 def _has_feedback(feedback, history) -> bool:
@@ -1339,7 +1396,7 @@ class Timeline:
                         "replaced": dt_util.now().isoformat(),
                     }
                 )
-                history = history[-MAX_HISTORY:]
+                history = _trim_history(history)
                 feedback = None
 
         try:
