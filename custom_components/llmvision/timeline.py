@@ -28,8 +28,42 @@ MAX_DETAILS_BYTES = 64 * 1024
 
 # The user's verdict on an event's analysis (set_feedback), and the longest
 # comment that may come with it
-FEEDBACK_VERDICTS = ("correct", "incorrect")
+# "incorrect" is "something's wrong" with nothing marked yet; with marks,
+# the verdict is the worst mark's severity ("wrong", else "minor")
+FEEDBACK_VERDICTS = ("correct", "incorrect", "minor", "wrong")
+MARK_SEVERITIES = ("minor", "wrong")
 MAX_FEEDBACK_COMMENT = 4000
+MAX_FEEDBACK_MARKS = 200
+# A mark's part: dot-separated path into the analysis, such as "title",
+# "animals.0.species", "animals.0" (not really there), "animals.missed.1",
+# "ratings.cute" or "other"
+_MARK_PART = re.compile(r"^[a-z0-9_]{1,40}(\.[a-z0-9_]{1,40}){0,3}$")
+
+
+def _parse_marks(marks) -> list[dict]:
+    """Validated feedback marks, [{part, severity}], one per part (the last
+    one given wins). Raises ServiceValidationError for a malformed mark."""
+    if marks is None:
+        return []
+    if not isinstance(marks, list):
+        raise ServiceValidationError("marks must be a list")
+    if len(marks) > MAX_FEEDBACK_MARKS:
+        raise ServiceValidationError(f"at most {MAX_FEEDBACK_MARKS} marks, got {len(marks)}")
+    by_part = {}
+    for mark in marks:
+        if not isinstance(mark, dict):
+            raise ServiceValidationError("each mark must be an object with part and severity")
+        part = str(mark.get("part") or "").strip().lower()
+        severity = str(mark.get("severity") or "").strip().lower()
+        if not _MARK_PART.match(part):
+            raise ServiceValidationError(f"invalid mark part '{part}'")
+        if severity not in MARK_SEVERITIES:
+            raise ServiceValidationError(
+                f"mark severity must be one of {', '.join(MARK_SEVERITIES)}, got '{severity}'"
+            )
+        by_part.pop(part, None)
+        by_part[part] = {"part": part, "severity": severity}
+    return list(by_part.values())
 # Earlier analyses kept per event (history), oldest dropped first
 MAX_HISTORY = 20
 
@@ -1338,21 +1372,31 @@ class Timeline:
         except aiosqlite.Error as e:
             _LOGGER.error(f"Error updating event in database: {e}")
 
-    async def set_feedback(self, uid: str, verdict, comment=None) -> dict | None:
+    async def set_feedback(self, uid: str, verdict, comment=None, marks=None) -> dict | None:
         """Sets the user's feedback on the event's current analysis, or clears it.
 
-        verdict is "correct" or "incorrect"; None or "" clears the feedback.
-        comment is free text (at most MAX_FEEDBACK_COMMENT characters). Stored
-        as {verdict, comment, given, updated}: given is when feedback was
-        first given on this analysis, updated when it last changed. Returns
-        the event as get_event does, or None when there is no such event.
-        Raises ServiceValidationError for another verdict or a long comment.
+        verdict is "correct" (everything is right), or "incorrect", "minor"
+        or "wrong" (something is); None or "" clears the feedback. marks
+        (only with something wrong) say what: [{part, severity}], severity
+        "minor" or "wrong", and every part not marked is taken as correct.
+        The stored verdict follows the marks: "wrong" when any mark is,
+        else "minor" when there are marks, else "incorrect". comment is free
+        text (at most MAX_FEEDBACK_COMMENT characters). Stored as {verdict,
+        comment, marks, given, updated}: given is when feedback was first
+        given on this analysis, updated when it last changed. Returns the
+        event as get_event does, or None when there is no such event.
+        Raises ServiceValidationError for another verdict, a malformed mark
+        or a long comment.
         """
         verdict = "" if verdict is None else str(verdict).strip().lower()
         if verdict and verdict not in FEEDBACK_VERDICTS:
             raise ServiceValidationError(
                 f"verdict must be one of {', '.join(FEEDBACK_VERDICTS)}, got '{verdict}'"
             )
+        marks = _parse_marks(marks) if verdict and verdict != "correct" else []
+        if verdict and verdict != "correct":
+            severities = {m["severity"] for m in marks}
+            verdict = "wrong" if "wrong" in severities else "minor" if severities else "incorrect"
         comment = "" if comment is None else str(comment).strip()
         if len(comment) > MAX_FEEDBACK_COMMENT:
             raise ServiceValidationError(
@@ -1365,7 +1409,13 @@ class Timeline:
         if verdict:
             now = dt_util.now().isoformat()
             given = (existing.get("feedback") or {}).get("given") or now
-            feedback = {"verdict": verdict, "comment": comment, "given": given, "updated": now}
+            feedback = {
+                "verdict": verdict,
+                "comment": comment,
+                "marks": marks,
+                "given": given,
+                "updated": now,
+            }
         try:
             async with aiosqlite.connect(self._db_path) as db:
                 await db.execute(

@@ -328,8 +328,9 @@ class TimelineEventView(HomeAssistantView):
 class TimelineEventFeedbackView(HomeAssistantView):
     """The user's feedback on an event's current analysis.
 
-    POST {"verdict": "correct" | "incorrect", "comment": "..."} sets it,
-    {"verdict": null} clears it. Returns {"event": ...} with the feedback.
+    POST {"verdict": "correct" | "incorrect", "comment": "...", "marks":
+    [{"part": "animals.0.species", "severity": "minor" | "wrong"}]} sets it
+    (see Timeline.set_feedback), {"verdict": null} clears it. Returns {"event": ...} with the feedback.
     Feedback is kept for scoring: events with it are not purged, and it
     moves to the event's history when the event is analyzed again.
     """
@@ -351,7 +352,9 @@ class TimelineEventFeedbackView(HomeAssistantView):
             return self.json_message("Body must be a JSON object", status_code=400)
         timeline = Timeline(hass, settings_entry)
         try:
-            event = await timeline.set_feedback(event_id, data.get("verdict"), data.get("comment"))
+            event = await timeline.set_feedback(
+                event_id, data.get("verdict"), data.get("comment"), data.get("marks")
+            )
         except ServiceValidationError as e:
             return self.json_message(str(e), status_code=400)
         except Exception as e:
