@@ -325,6 +325,43 @@ class TimelineEventView(HomeAssistantView):
             return self.json({"event_id": event_id, "status": "updated"})
 
 
+class TimelineEventKeepView(HomeAssistantView):
+    """Whether the event is kept past the retention time.
+
+    POST {"keep": true | false} (see Timeline.set_keep). Returns {"event":
+    ...} with keep, reviewed (reviewed events are always kept) and
+    purge_after.
+    """
+
+    url = "/api/llmvision/timeline/event/{event_id}/keep"
+    name = "api:llmvision:timeline:event:keep"
+    requires_auth = True
+
+    async def post(self, request, event_id):
+        hass = request.app["hass"]
+        settings_entry = await async_get_settings_entry(hass)
+        if settings_entry is None:
+            return self.json_message("Settings config entry not found", status_code=404)
+        try:
+            data = await request.json()
+        except Exception:
+            return self.json_message("Invalid JSON body", status_code=400)
+        if not isinstance(data, dict):
+            return self.json_message("Body must be a JSON object", status_code=400)
+        timeline = Timeline(hass, settings_entry)
+        try:
+            event = await timeline.set_keep(event_id, data.get("keep"))
+        except ServiceValidationError as e:
+            return self.json_message(str(e), status_code=400)
+        except Exception as e:
+            _LOGGER.error(f"Error saving keep for event {event_id}: {e}")
+            return self.json_message("Error saving keep", status_code=500)
+        if event is None:
+            return self.json_message("Event not found", status_code=404)
+        async_dispatcher_send(hass, SIGNAL_TIMELINE_UPDATED)
+        return self.json({"event": json.loads(json_dumps(event))})
+
+
 class TimelineEventFeedbackView(HomeAssistantView):
     """The user's feedback on an event's current analysis.
 

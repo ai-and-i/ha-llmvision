@@ -11,7 +11,7 @@ from homeassistant.core import SupportsResponse
 from homeassistant.exceptions import ServiceValidationError
 import homeassistant.helpers.config_validation as cv
 from homeassistant.helpers.dispatcher import async_dispatcher_send
-from .api import TimelineEventView, TimelineEventsView, TimelineEventCreateView, TimelineEventFeedbackView
+from .api import TimelineEventView, TimelineEventsView, TimelineEventCreateView, TimelineEventFeedbackView, TimelineEventKeepView
 
 import logging
 
@@ -1108,5 +1108,6 @@ def setup(hass, config):
     hass.http.register_view(TimelineEventView)
     hass.http.register_view(TimelineEventCreateView)
     hass.http.register_view(TimelineEventFeedbackView)
+    hass.http.register_view(TimelineEventKeepView)
 
     return True

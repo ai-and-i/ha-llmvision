@@ -21,7 +21,7 @@ import logging
 
 _LOGGER = logging.getLogger(__name__)
 
-DB_VERSION = 8
+DB_VERSION = 9
 
 # Largest details value (as JSON) an event may carry
 MAX_DETAILS_BYTES = 64 * 1024
@@ -453,6 +453,7 @@ class Event:
         details=None,
         feedback: dict | None = None,
         history: list | None = None,
+        keep: bool = False,
     ):
         self.uid = uid
         self.title = title
@@ -474,6 +475,8 @@ class Event:
         self.feedback = feedback
         # Earlier analyses of the clip, each with the feedback it had, oldest first
         self.history = list(history) if history else []
+        # Kept past the retention time at the user's request (set_keep)
+        self.keep = bool(keep)
 
     def __repr__(self):
         return f"Event(uid={self.uid}, title={self.title}, start={self.start}, end={self.end}, description={self.description}, key_frame={self.key_frame}, camera_name={self.camera_name}, category={self.category}, label={self.label}, labels={self.labels}, clip={self.clip}, details={self.details})"
@@ -556,6 +559,7 @@ class Timeline:
             "details",
             "feedback",
             "history",
+            "keep",
         }
         try:
             async with aiosqlite.connect(self._db_path) as db:
@@ -585,7 +589,8 @@ class Timeline:
                         labels TEXT,
                         details TEXT,
                         feedback TEXT,
-                        history TEXT
+                        history TEXT,
+                        keep INTEGER
                     )
                 """)
                 await db.execute("""
@@ -609,7 +614,7 @@ class Timeline:
             _LOGGER.debug(f"Post-init version set skipped: {e}")
 
     async def _migrate(self):
-        """Handles migration for events.db (current v8)"""
+        """Handles migration for events.db (current v9)"""
         try:
             lock = _MIGRATION_LOCKS.setdefault(self._db_path, asyncio.Lock())
             async with lock:
@@ -628,6 +633,7 @@ class Timeline:
                     await self._migrate_to_v6()
                 await self._migrate_to_v7()
                 await self._migrate_to_v8()
+                await self._migrate_to_v9()
 
                 # Mark migration complete by setting user_version
                 await self._set_db_version(DB_VERSION)
@@ -886,6 +892,19 @@ class Timeline:
         except aiosqlite.Error as e:
             _LOGGER.error(f"Error migrating events.db to v8: {e}")
 
+    async def _migrate_to_v9(self):
+        """v8 -> v9: add the keep column (1 = kept past the retention time)."""
+        try:
+            async with aiosqlite.connect(self._db_path) as db:
+                async with db.execute("PRAGMA table_info(events)") as cursor:
+                    column_names = [column[1] for column in await cursor.fetchall()]
+                if "keep" not in column_names:
+                    _LOGGER.info("Adding keep column to events.db")
+                    await db.execute("ALTER TABLE events ADD COLUMN keep INTEGER")
+                    await db.commit()
+        except aiosqlite.Error as e:
+            _LOGGER.error(f"Error migrating events.db to v9: {e}")
+
     def _ensure_datetime(self, dt):
         """Ensures the input is a datetime.datetime object"""
         if isinstance(dt, datetime.date) and not isinstance(dt, datetime.datetime):
@@ -917,6 +936,56 @@ class Timeline:
 
         return days
 
+    def _retention_info(self, start, keep, feedback, history) -> dict:
+        """An event's retention fields for the API.
+
+        keep is the user's choice (set_keep). reviewed is whether the
+        event has feedback, current or in history: reviewed events are
+        always kept. purge_after is when retention removes the event unless
+        it is kept or reviewed (None without a retention time or a start).
+        feedback and history may be the raw columns or parsed values.
+        """
+        if isinstance(feedback, str) or feedback is None:
+            feedback = _parse_feedback(feedback)
+        if not isinstance(history, list):
+            history = _parse_history(history)
+        purge_after = None
+        days = self._get_retention_days()
+        if days and start:
+            if isinstance(start, str):
+                start = dt_util.parse_datetime(start)
+            if start:
+                start = self._ensure_datetime(start)
+                purge_after = dt_util.as_local(start + datetime.timedelta(days=days)).isoformat()
+        return {
+            "keep": bool(keep),
+            "reviewed": _has_feedback(feedback, history),
+            "purge_after": purge_after,
+        }
+
+    async def set_keep(self, uid: str, keep) -> dict | None:
+        """Keeps the event (and its key frame and clip) past the retention
+        time, or lets retention remove it again. Reviewed events are kept
+        whatever this says. Returns the event as get_event does, or None
+        when there is no such event. Raises ServiceValidationError unless
+        keep is a boolean.
+        """
+        if not isinstance(keep, bool):
+            raise ServiceValidationError(f"keep must be true or false, got {keep!r}")
+        try:
+            async with aiosqlite.connect(self._db_path) as db:
+                cursor = await db.execute(
+                    "UPDATE events SET keep = ? WHERE uid = ?", (1 if keep else None, uid)
+                )
+                await db.commit()
+                if cursor.rowcount == 0:
+                    return None
+        except aiosqlite.Error as e:
+            _LOGGER.error(f"Error saving keep for event {uid}: {e}")
+            raise
+        _LOGGER.info(f"Event {uid}: {'kept' if keep else 'not kept'}")
+        return await self.get_event(uid)
+
     async def _purge_expired_events(self) -> None:
         """Remove events older than now - retention_time days."""
         if getattr(self, "_migrating", False):
@@ -933,17 +1002,19 @@ class Timeline:
             async with aiosqlite.connect(self._db_path) as db:
                 async with db.execute(
                     """
-                    SELECT uid, key_frame, feedback, history FROM events
+                    SELECT uid, key_frame, feedback, history, keep FROM events
                     WHERE start IS NOT NULL AND start < ?
                 """,
                     (cutoff_local,),
                 ) as cursor:
-                    # Events with the user's feedback are kept for scoring,
-                    # with their key frame and clip
+                    # Events the user keeps, and events with their feedback
+                    # (the ground truth for scoring), stay with their key
+                    # frame and clip
                     stale_rows = [
                         row
                         for row in await cursor.fetchall()
-                        if not _has_feedback(_parse_feedback(row[2]), _parse_history(row[3]))
+                        if not row[4]
+                        and not _has_feedback(_parse_feedback(row[2]), _parse_history(row[3]))
                     ]
 
                 if not stale_rows:
@@ -1014,7 +1085,7 @@ class Timeline:
                     SELECT
                         uid, title, start, end, description,
                         category, key_frame, camera_name, label, clip, labels, details,
-                        feedback, history
+                        feedback, history, keep
                     FROM events
                     """) as cursor:
                     rows = await cursor.fetchall()
@@ -1049,6 +1120,7 @@ class Timeline:
                             details=_parse_details(row[11]),
                             feedback=_parse_feedback(row[12]),
                             history=_parse_history(row[13]),
+                            keep=bool(row[14]),
                         )
                         self.events.append(event)
         except aiosqlite.Error as e:
@@ -1079,6 +1151,7 @@ class Timeline:
                     "details": event.details,
                     "feedback": event.feedback,
                     "history": event.history,
+                    **self._retention_info(event.start, event.keep, event.feedback, event.history),
                 }
                 return event_dict
         return None
@@ -1128,7 +1201,7 @@ class Timeline:
                 SELECT
                     uid, title, start, end, description,
                     category, key_frame, camera_name, label, clip, labels, details,
-                        feedback, history
+                        feedback, history, keep
                 FROM events
                 """) as cursor:
                 rows = await cursor.fetchall()
@@ -1191,6 +1264,7 @@ class Timeline:
                             "details": _parse_details(row[11]),
                             "feedback": _parse_feedback(row[12]),
                             "history_count": len(_parse_history(row[13])),
+                            **self._retention_info(row_start, row[14], row[12], row[13]),
                         }
                     )
 
