@@ -111,10 +111,13 @@ def _parse_marks(marks) -> list[dict]:
 # Earlier analyses kept per event (history), oldest dropped first
 MAX_HISTORY = 20
 
-# Unlinked files younger than this are kept by _cleanup. Snapshots only need
-# to survive the event insert. A clip from video_analyzer may be attached by a
-# later create_event call, after the model has answered.
-SNAPSHOT_GRACE_SECONDS = 30
+# Unlinked files younger than this are kept by _cleanup. A key frame or clip
+# from video_analyzer is attached by a later create_event call, after the
+# model has answered, which can take minutes; the key frame is written before
+# the model is asked. Meanwhile any other Timeline (another analysis finishing,
+# a dashboard refresh) runs _cleanup, so a short grace deleted key frames of
+# analyses running in parallel.
+SNAPSHOT_GRACE_SECONDS = 60 * 60
 CLIP_GRACE_SECONDS = 60 * 60
 
 # A Timeline is created per API request and service call, and each one
